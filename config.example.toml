@@ -1,0 +1,29 @@
+# Copy to config.local.toml. Never commit real identities or bot tokens.
+data_dir = ".state"
+primary_id = 100001        # EXAMPLE ONLY: replace before live use
+secondary_id = 100002      # EXAMPLE ONLY: distinct second account
+token_env = "TELEGRAM_BOT_TOKEN"
+
+# Official Codex with existing ChatGPT login; no OpenAI API key required.
+# doctor/demo remain offline regardless of this setting.
+backend = "codex_subscription"
+model = "gpt-6-sol"
+reasoning = "medium"
+# read: observations only; full: PRIMARY can also write files/run PowerShell.
+pc_access = "read"
+web_enabled = false
+web_base_url = "http://127.0.0.1:17841/v1"
+codex_executable = "codex"
+observe_interval = 5.0
+timezone_name = "Europe/Moscow"
+max_attachment_bytes = 20971520
+max_pending_tasks = 16
+brain_timeout = 180.0
+
+# Optional local voice recognition. No automatic downloads or cloud STT.
+whisper_executable = ""
+whisper_model = ""
+ffmpeg_executable = ""
+
+[project_roots]
+# nagaport = 'C:\Users\nagas\Desktop\port\ntm-port-1.12.2'

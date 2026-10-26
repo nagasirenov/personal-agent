@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.state/
+config.local.toml
+.env
+*.log
+.coverage

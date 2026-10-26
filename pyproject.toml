@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "windows-personal-agent"
+version = "0.1.0"
+description = "Local-first Telegram memory and passive Windows observer"
+requires-python = ">=3.12"
+dependencies = ["httpx>=0.28,<1"]
+
+[project.scripts]
+personal-agent = "personal_agent.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["personal_agent*"]

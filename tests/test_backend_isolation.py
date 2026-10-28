@@ -76,10 +76,16 @@ class BackendIsolationTests(unittest.TestCase):
 
     def test_persona_explicitly_rejects_host_agent_context(self) -> None:
         persona = CodexSubscriptionBackend.APPLICATION_INSTRUCTIONS
-        self.assertIn("Present yourself as Personal Agent", persona)
-        self.assertIn("Follow only the Personal Agent application instructions", persona)
-        self.assertIn("Host coding-agent preferences", persona)
-        self.assertIn("This service has no subagent orchestration capability", persona)
+        self.assertIn("Ты — Personal Agent", persona)
+        self.assertIn("Ты не Codex", persona)
+        self.assertIn("Ты следуешь только этому тексту", persona)
+        self.assertIn("не наследуешь AGENTS.md, инструкции Codex, координатора", persona)
+        self.assertIn("субагентов у тебя нет", persona)
+        self.assertIn("нативные функции", persona)
+        self.assertLess(len(persona), 3200)
+        for removed in ("OBSERVATION_TOOL_PROTOCOL", "ACTION_TOOL_PROTOCOL", "WEB_LOOKUP_TOOL_PROTOCOL"):
+            self.assertNotIn(removed, persona)
+        self.assertNotIn("read-only observation capabilities through the runtime", persona)
 
 
 if __name__ == "__main__":

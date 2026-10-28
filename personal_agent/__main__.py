@@ -69,7 +69,7 @@ async def demo() -> dict:
             ignored = len(telegram.replies) == 0 and len(supervisor.tasks) == 0
             await gateway.dispatch_batch([update(config.secondary_id, "Чем я занимался последние два часа?", 2)])
             await asyncio.gather(*list(supervisor.tasks))
-            packet = ContextBuilder(store, config.tz).build("Чем я занимался последние два часа?", config.secondary_id)
+            packet = ContextBuilder(store, config.tz, config=config).build("Чем я занимался последние два часа?", config.secondary_id)
             denied = False
             try:
                 ActionGate().authorize(config.secondary_id, {"kind": "shell", "command": "cmd"})
@@ -113,6 +113,8 @@ def main() -> int:
     check.add_argument("--config", type=Path)
     commands.add_parser("demo", help="Offline synthetic integration demo; no Telegram connection")
     commands.add_parser("telegram-ids", help="Explicit setup: show numeric IDs of private bot senders; requires token env var")
+    browser_token = commands.add_parser("browser-token", help="Print the local token for pairing the read-only browser companion")
+    browser_token.add_argument("--config", type=Path, default=Path("config.local.toml"))
     run = commands.add_parser("run", help="Start passive daemon explicitly")
     run.add_argument("--config", type=Path, default=Path("config.local.toml"))
     args = parser.parse_args()
@@ -123,6 +125,11 @@ def main() -> int:
             result = asyncio.run(demo())
         elif args.command == "telegram-ids":
             result = asyncio.run(discover_ids())
+        elif args.command == "browser-token":
+            from .browser_bridge import get_or_create_browser_token
+            config = load_config(args.config)
+            print(get_or_create_browser_token(config.data_dir))
+            return 0
         else:
             from .daemon import run_daemon
             config = load_config(args.config, live=True)

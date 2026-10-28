@@ -41,6 +41,12 @@ async def terminate_tree(process: asyncio.subprocess.Process) -> None:
 
 class LocalTranscriber:
     def __init__(self, root: Path, whisper: str = "", model: str = "", ffmpeg: str = ""):
+        if not ffmpeg:
+            try:
+                from imageio_ffmpeg import get_ffmpeg_exe
+                ffmpeg = get_ffmpeg_exe()
+            except (ImportError, RuntimeError):
+                pass
         self.root, self.whisper, self.model, self.ffmpeg = root.resolve(), whisper, model, ffmpeg
         self.processes: set[asyncio.subprocess.Process] = set()
         self._closed = False
@@ -65,6 +71,8 @@ class LocalTranscriber:
                 raise TranscriptionUnavailable("Local transcription tool failed")
         except FileNotFoundError:
             raise TranscriptionUnavailable("Local transcription executable not found") from None
+        except TimeoutError:
+            raise TranscriptionUnavailable("Локальное распознавание голосового заняло слишком много времени; файл сохранён.") from None
         finally:
             if process is not None:
                 await terminate_tree(process)

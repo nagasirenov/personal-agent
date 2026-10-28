@@ -25,5 +25,13 @@ whisper_executable = ""
 whisper_model = ""
 ffmpeg_executable = ""
 
+# Sending files to Telegram: the hosted Bot API caps bot uploads at 50 MB (videos are re-encoded to fit).
+# A local Bot API server raises that to 2000 MB: telegram_api_base = "http://127.0.0.1:8081".
+telegram_api_base = "https://api.telegram.org"
+# Other files over the cap are uploaded to Google Drive with rclone and sent as a link (otherwise split
+# into .partNN files). One-time setup: install rclone, run `rclone config` (remote "gdrive").
+drive_remote = ""            # for example "gdrive:PersonalAgent"
+rclone_executable = ""       # empty = rclone on PATH or the WinGet install
+
 [project_roots]
 # nagaport = 'C:\Users\nagas\Desktop\port\ntm-port-1.12.2'

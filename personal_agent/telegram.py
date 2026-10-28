@@ -18,14 +18,27 @@ class TelegramError(RuntimeError):
     pass
 
 
+DEFAULT_API_BASE = "https://api.telegram.org"
+CLOUD_UPLOAD_CAP = 50 * 1024 * 1024        # the hosted Bot API refuses bot uploads above 50 MB
+LOCAL_UPLOAD_CAP = 2000 * 1024 * 1024      # a self-hosted Bot API server accepts up to 2000 MB
+_UPLOAD_TIMEOUT = httpx.Timeout(connect=30.0, read=900.0, write=900.0, pool=30.0)
+
+
 class TelegramClient:
-    def __init__(self, token: str, *, client: httpx.AsyncClient | None = None):
+    def __init__(self, token: str, *, client: httpx.AsyncClient | None = None, api_base: str = DEFAULT_API_BASE):
         if not token or ":" not in token or any(c.isspace() for c in token):
             raise ValueError("Invalid Telegram token format")
-        self._base = "https://api.telegram.org/bot" + token + "/"
-        self._file_base = "https://api.telegram.org/file/bot" + token + "/"
+        api_base = (api_base or DEFAULT_API_BASE).rstrip("/")
+        self.api_base = api_base
+        self._base = api_base + "/bot" + token + "/"
+        self._file_base = api_base + "/file/bot" + token + "/"
         # Ignore proxy env vars to avoid forwarding bot credentials accidentally.
         self._client = client or httpx.AsyncClient(timeout=35, follow_redirects=False, trust_env=False)
+
+    @property
+    def upload_cap_bytes(self) -> int:
+        """The single place that knows the bot upload limit of the Bot API in use."""
+        return CLOUD_UPLOAD_CAP if self.api_base == DEFAULT_API_BASE else LOCAL_UPLOAD_CAP
 
     async def call(self, method: str, payload: dict[str, Any]) -> Any:
         try:
@@ -52,7 +65,13 @@ class TelegramClient:
                 "link_preview_options": {"is_disabled": True},
             })
 
-    async def send_photo(self, chat_id: int, path: Path, caption: str = "") -> None:
+    async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
+        """Show "typing..." in the chat for about 5 seconds (or until a message arrives)."""
+        await self.call("sendChatAction", {"chat_id": chat_id, "action": action})
+
+    async def send_photo(self, chat_id: int, path: Path, caption: str = "") -> str:
+        """Upload an image; returns the Bot API method actually used (sendPhoto or sendDocument)."""
+        import mimetypes
         import struct
         size = path.stat().st_size
         if size > 50 * 1024 * 1024:
@@ -66,13 +85,43 @@ class TelegramClient:
             with path.open("rb") as image:
                 response = await self._client.post(self._base + method,
                     data={"chat_id": str(chat_id), "caption": caption[:1000]},
-                    files={field: (path.name, image, "image/png")})
+                    files={field: (path.name, image, mimetypes.guess_type(path.name)[0] or "image/png")})
             response.raise_for_status()
             result = response.json()
             if not result.get("ok"):
                 raise TelegramError(f"Telegram rejected {method} (code {result.get('error_code', 'unknown')})")
         except (httpx.HTTPError, ValueError):
             raise TelegramError("Telegram screenshot upload failed") from None
+        return method
+
+    async def _upload(self, method: str, field: str, chat_id: int, path: Path, caption: str, extra: dict) -> str:
+        """Multipart upload streamed from disk (the file is never read into memory)."""
+        import mimetypes
+        data = {"chat_id": str(chat_id), **extra}
+        if caption:
+            data["caption"] = caption[:1000]
+        try:
+            with path.open("rb") as handle:
+                response = await self._client.post(
+                    self._base + method, data=data, timeout=_UPLOAD_TIMEOUT,
+                    files={field: (path.name, handle, mimetypes.guess_type(path.name)[0] or "application/octet-stream")})
+            response.raise_for_status()
+            body = response.json()
+            if not body.get("ok"):
+                raise TelegramError(f"Telegram rejected {method} (code {body.get('error_code', 'unknown')})")
+        except (httpx.HTTPError, ValueError, OSError):
+            # httpx exception messages include the bot token in their request URL.
+            raise TelegramError(f"Telegram {method} upload failed") from None
+        return method
+
+    async def send_document(self, chat_id: int, path: Path, caption: str = "") -> str:
+        return await self._upload("sendDocument", "document", chat_id, path, caption, {})
+
+    async def send_video(self, chat_id: int, path: Path, caption: str = "") -> str:
+        return await self._upload("sendVideo", "video", chat_id, path, caption, {"supports_streaming": "true"})
+
+    async def send_audio(self, chat_id: int, path: Path, caption: str = "") -> str:
+        return await self._upload("sendAudio", "audio", chat_id, path, caption, {})
 
     async def download(self, file_id: str, destination: Path, max_bytes: int) -> int:
         info = await self.call("getFile", {"file_id": file_id})
@@ -116,12 +165,20 @@ def parse_message(update: dict) -> IncomingMessage | None:
     if type(user_id) is not int or type(chat_id) is not int or user_id != chat_id:
         return None
     attachment = None
-    for kind in ("document", "voice", "audio", "video", "video_note", "animation", "photo"):
+    for kind in ("document", "voice", "audio", "video", "video_note", "animation", "sticker", "photo"):
         media = message.get(kind)
         if kind == "photo" and isinstance(media, list) and media:
             media = media[-1]
         if isinstance(media, dict) and media.get("file_id"):
             attachment = dict(media, kind=kind)
+            if kind == "sticker":
+                is_animated = bool(media.get("is_animated"))
+                is_video = bool(media.get("is_video"))
+                attachment.update({
+                    "is_animated": is_animated,
+                    "is_video": is_video,
+                    "sticker_format": "webm" if is_video else "tgs" if is_animated else "webp",
+                })
             break
     text = message.get("text", message.get("caption", ""))
     return IncomingMessage(

@@ -188,6 +188,33 @@ class BrainGatewayTests(unittest.IsolatedAsyncioTestCase):
                         await writer.wait_closed()
                 self.assertEqual(gateway.request_count, 0)
 
+    async def test_first_error_code_survives_the_cli_follow_up_retry(self):
+        async def upstream(request):
+            return httpx.Response(429, text="slow down")
+        with self.mocked_upstream(upstream):
+            async with self.gateway(upstream_url="http://127.0.0.1:1/responses", require_auth=False) as gateway:
+                async with _CLIENT(trust_env=False) as caller:
+                    first = await caller.post(gateway.base_url + "/responses", json={})
+                    # The CLI retries on a different route / with a bad request after the failure.
+                    retry = await caller.post(gateway.base_url.rsplit("/", 1)[0] + "/other/responses", json={})
+                self.assertEqual(first.status_code, 429)
+                self.assertEqual(retry.status_code, 404)
+                self.assertEqual(gateway.last_error_code, "gateway_upstream_http_429")
+
+    async def test_route_probe_before_the_request_does_not_hide_the_real_failure(self):
+        async def upstream(request):
+            return httpx.Response(500, text="boom")
+        with self.mocked_upstream(upstream):
+            async with self.gateway(upstream_url="http://127.0.0.1:1/responses", require_auth=False) as gateway:
+                async with _CLIENT(trust_env=False) as caller:
+                    probe = await caller.post(gateway.base_url.rsplit("/", 1)[0] + "/models", json={})
+                    self.assertEqual(probe.status_code, 404)
+                    self.assertEqual(gateway.last_error_code, "gateway_route_rejected")
+                    real = await caller.post(gateway.base_url + "/responses", json={})
+                    again = await caller.post(gateway.base_url.rsplit("/", 1)[0] + "/models", json={})
+                self.assertEqual((real.status_code, again.status_code), (500, 404))
+                self.assertEqual(gateway.last_error_code, "gateway_upstream_http_500")
+
     async def test_upstream_errors_are_static_and_redirects_are_not_followed(self):
         for status in (302, 400, 401, 403, 429, 500):
             async def upstream(request):

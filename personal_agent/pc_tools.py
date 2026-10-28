@@ -14,7 +14,10 @@ MAX_OUTPUT_BYTES = 16 * 1024
 MAX_WRITE_BYTES = 256 * 1024
 _POWERSHELL_PREAMBLE = (
     "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
-    "$OutputEncoding = [Console]::OutputEncoding;\n"
+    "$OutputEncoding = [Console]::OutputEncoding; "
+    "$ConfirmPreference = 'None'; "
+    "$ProgressPreference = 'SilentlyContinue'; "
+    "$PSDefaultParameterValues['Invoke-WebRequest:UseBasicParsing'] = $true;\n"
 )
 _PRIVATE_ENV_NAMES = {"TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY"}
 

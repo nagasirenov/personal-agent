@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Personal Agent — подключение</title>
+  <style>
+    body { font: 15px system-ui, sans-serif; max-width: 620px; margin: 40px auto; padding: 0 20px; color: #18202a; }
+    label { display: block; margin: 24px 0 8px; font-weight: 600; }
+    input { box-sizing: border-box; width: 100%; padding: 10px; font: inherit; }
+    button { margin-top: 18px; padding: 9px 16px; font: inherit; cursor: pointer; }
+    #status { min-height: 1.5em; margin-top: 14px; }
+    small { color: #4c5968; }
+  </style>
+</head>
+<body>
+  <h1>Подключение к Personal Agent</h1>
+  <p>Расширение передаёт данные только активной вкладки локальному daemon на этом ПК.</p>
+  <label for="token">Локальный token</label>
+  <input id="token" type="password" autocomplete="off" spellcheck="false">
+  <small>В PowerShell из папки проекта выполни <code>.\.venv\Scripts\python.exe -m personal_agent browser-token --config config.local.toml</code>. Не отправляй token в Telegram.</small>
+  <br>
+  <button id="save" type="button">Сохранить</button>
+  <div id="status" role="status" aria-live="polite"></div>
+  <script src="options.js"></script>
+</body>
+</html>

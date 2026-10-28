@@ -1,0 +1,13 @@
+{
+  "name": "personal-agent-context-bridge",
+  "displayName": "Personal Agent Context Bridge",
+  "description": "Shares bounded local VS Code context with Personal Agent.",
+  "version": "0.1.0",
+  "publisher": "personal-agent",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "extensionKind": ["ui"],
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished"]
+}

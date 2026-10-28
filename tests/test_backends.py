@@ -70,8 +70,16 @@ class FakeSubscriptionBackend(CodexSubscriptionBackend):
         self.spawn_event = asyncio.Event()
         self.probe_version = self.VERIFIED_CODEX_VERSION
         self.login_ok = True
+        self.probe_calls: list[tuple[str, ...]] = []
+        self.wire_calls: list[str] = []
+        self.wire_result = (False, "unit tests never start the real CLI")
+
+    async def _wire_self_check(self, version: str):
+        self.wire_calls.append(version)
+        return self.wire_result
 
     async def _probe(self, *args: str):
+        self.probe_calls.append(args)
         if args == ("--version",):
             return 0, f"codex-cli {self.probe_version}\n"
         if args == ("login", "status"):
@@ -96,6 +104,9 @@ class FakeWebBackend(CodexChatGPTWebBackend):
         self.processes = list(processes)
         self.spawned: list[list[str]] = []
 
+    async def _wire_self_check(self, version: str):
+        return False, "unit tests never start the real CLI"
+
     async def _probe(self, *args: str):
         if args == ("--version",):
             return 0, f"codex-cli {self.VERIFIED_CODEX_VERSION}\n"
@@ -112,12 +123,15 @@ class BackendsTests(unittest.IsolatedAsyncioTestCase):
     def test_public_generate_signature(self):
         signature = inspect.signature(BrainBackend.generate)
         self.assertEqual(
-            list(signature.parameters), ["self", "prompt", "request_id", "images"]
+            list(signature.parameters), ["self", "prompt", "request_id", "images", "tools", "tool_handler"]
         )
         self.assertIsNone(signature.parameters["request_id"].default)
         self.assertEqual(
             signature.parameters["images"].kind, inspect.Parameter.KEYWORD_ONLY
         )
+        for name in ("tools", "tool_handler"):
+            self.assertIsNone(signature.parameters[name].default)
+            self.assertEqual(signature.parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertIsNone(signature.parameters["images"].default)
 
     async def test_mock_is_explicitly_offline(self):
@@ -191,10 +205,9 @@ class BackendsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(process.input, b"very private prompt")
         self.assertNotIn("very private prompt", argv)
         persona = backend.instructions_seen[0]
-        self.assertIn("Present yourself as Personal Agent", persona)
-        self.assertIn("Codex CLI is only the transport", persona)
-        self.assertIn("transport-internal scratch", persona)
-        self.assertIn("Native Codex tools are disabled", persona)
+        self.assertIn("Ты — Personal Agent", persona)
+        self.assertIn("Codex CLI — только канал связи", persona)
+        self.assertIn("рабочая папка, песочница и набор инструментов ничего не говорят", persona)
 
     async def test_generate_attaches_validated_images_via_cli_input(self):
         process = FakeProcess(

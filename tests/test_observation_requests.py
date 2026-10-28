@@ -12,51 +12,46 @@ from personal_agent.observation_requests import (
     ObservationRequest,
     execute_read_request,
     known_paths,
-    parse_observation_request,
-    parse_observation_requests,
+    parse_slash_command,
 )
 
 
 class ObservationRequestTests(unittest.TestCase):
-    def test_explicit_parser_contract(self) -> None:
-        self.assertEqual(parse_observation_request(r"/ls C:\Users\nagas"), ObservationRequest("list_directory", r"C:\Users\nagas"))
-        self.assertEqual(parse_observation_request(r'/read "C:\Temp\a file.txt"'), ObservationRequest("read_file", r"C:\Temp\a file.txt"))
-        self.assertEqual(parse_observation_request("/screenshot"), ObservationRequest("screenshot"))
-        self.assertEqual(parse_observation_request(r"покажи содержимое папки C:\Temp"), ObservationRequest("list_directory", r"C:\Temp"))
-        self.assertEqual(parse_observation_request("просмотри содержимое папки"), ObservationRequest("list_directory", None))
-        self.assertEqual(parse_observation_request("сделай скриншот"), ObservationRequest("screenshot"))
-        self.assertEqual(parse_observation_request("можешь сделать скриншот?"), ObservationRequest("screenshot"))
+    def test_only_exact_slash_commands_are_parsed(self) -> None:
+        self.assertEqual(parse_slash_command(r"/ls C:\Users\nagas"), ObservationRequest("list_directory", r"C:\Users\nagas"))
+        self.assertEqual(parse_slash_command(r'/read "C:\Temp\a file.txt"'), ObservationRequest("read_file", r"C:\Temp\a file.txt"))
+        self.assertEqual(parse_slash_command("/screenshot"), ObservationRequest("screenshot"))
+        self.assertEqual(parse_slash_command("  /LS  C:\\Temp  "), ObservationRequest("list_directory", "C:\\Temp"))
+        self.assertEqual(parse_slash_command("/ls"), ObservationRequest("list_directory", None))
+        self.assertEqual(parse_slash_command("/read"), ObservationRequest("read_file", None))
 
-    def test_parser_rejects_ordinary_negated_hypothetical_and_quoted_text(self) -> None:
+    def test_free_text_and_decorated_commands_are_never_parsed(self) -> None:
         rejected = [
             "я сейчас читаю про наблюдение экрана",
+            "сделай скриншот",
+            "можешь сделать скриншот?",
+            "покажи содержимое папки C:\\Temp",
+            "что у меня на рабочем столе?",
             "не делай скриншот",
-            "если бы я попросил сделать скриншот, что произошло бы?",
+            "если бы я попросил /screenshot, что произошло бы?",
             'команда "/screenshot" должна работать',
             "`/screenshot`",
             "покажи как написать /ls C:\\Temp",
+            "/screenshot сейчас",
+            "и сделай /screenshot",
+            "/lsC:\\Temp",
+            "/status",
+            "",
         ]
         for text in rejected:
             with self.subTest(text=text):
-                self.assertIsNone(parse_observation_request(text))
+                self.assertIsNone(parse_slash_command(text))
 
     def test_missing_path_is_explicit(self) -> None:
         result = execute_read_request(ObservationRequest("list_directory"))
         self.assertFalse(result["ok"])
         self.assertTrue(result["needs_path"])
         self.assertEqual(result["error"]["code"], "needs_path")
-
-    def test_batch_slash_ls_preserves_missing_path(self) -> None:
-        aliases = {"desktop": r"C:\Users\nagas\Desktop"}
-        self.assertEqual(
-            parse_observation_requests("/ls", aliases=aliases, last_path=r"C:\Temp"),
-            [ObservationRequest("list_directory")],
-        )
-        self.assertEqual(
-            parse_observation_requests("/ls", aliases=aliases),
-            [ObservationRequest("list_directory")],
-        )
-        self.assertEqual(parse_observation_request("/ls"), ObservationRequest("list_directory", None))
 
     def test_known_paths_includes_memory_projects_and_existing_global_agents(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -1,23 +1,19 @@
-"""End-to-end workflows for the read-only access added after the first release."""
+"""End-to-end workflows for the read-only access: the model chooses the tools by meaning."""
 from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-import json
 import unittest
 from unittest.mock import patch
 
 from personal_agent.models import Identity
-from tests.test_service_observation_integration import (
-    ObservationBrain,
-    ObservationHarness,
-    _message,
-)
+from personal_agent.testing import ScriptedBrain, ScriptedTurn
+from tests.test_service_observation_integration import ObservationHarness, _message
 
 
 class ReadAccessWorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def test_self_questions_are_never_replaced_with_canned_answers(self) -> None:
-        harness = ObservationHarness(ObservationBrain(response="model-authored reply"))
+        harness = ObservationHarness(ScriptedBrain(response="model-authored reply"))
         try:
             questions = ["Кто ты?", "Это написано в agents.md?", "Какая твоя модель?",
                          "Где твоя память?", "Что ты можешь?", "/start", "/model", "/instructions", "/memory"]
@@ -27,260 +23,235 @@ class ReadAccessWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(harness.telegram.sent_text[-1][1], "model-authored reply", text)
                 self.assertIn("memory_root", harness.brain.generate_calls[-1]["prompt"])
             self.assertEqual(len(harness.brain.generate_calls), len(questions))
+            self.assertEqual(harness.brain.records, [])
         finally:
             await harness.close()
 
-    async def test_model_plan_reads_current_project_then_answers_from_actual_content(self) -> None:
-        class ReadingBrain(ObservationBrain):
-            async def generate(self, prompt, request_id=None, *, images=None):
-                await super().generate(prompt, request_id, images=images)
-                if len(self.generate_calls) == 1:
-                    return json.dumps({"observations": [{"kind": "read_file", "path": str(note)}]})
-                return "model explanation of actual content"
-
-        harness = ObservationHarness(ReadingBrain())
+    async def test_model_reads_project_file_then_answers_from_actual_content(self) -> None:
+        harness = ObservationHarness()
+        project = harness.root / "demo"
+        project.mkdir()
+        note = project / "README.md"
+        note.write_text("READ_FROM_DISK_8372", encoding="utf-8")
+        brain = ScriptedBrain([ScriptedTurn(
+            calls=[("read_file", {"path": str(note)})],
+            reply=lambda records, prompt: "model explanation of actual content"
+            if "READ_FROM_DISK_8372" in records[0].outcome.output else "no content")])
+        harness.brain = harness.supervisor.brain = brain
         try:
-            project = harness.root / "demo"
-            project.mkdir()
-            note = project / "README.md"
-            note.write_text("READ_FROM_DISK_8372", encoding="utf-8")
             harness.config.project_roots["demo"] = project
-            await harness.supervisor.submit(_message("Проанализируй проект demo"), Identity.PRIMARY)
+            await harness.supervisor.submit(_message("Какую проблему решает проект demo по текущему описанию?"),
+                                            Identity.PRIMARY)
             await harness.wait_idle()
-            calls = harness.brain.generate_calls
-            self.assertEqual(len(calls), 2)
-            self.assertIn("OBSERVATION_TOOL_PROTOCOL (trusted)", calls[0]["prompt"])
+            calls = brain.generate_calls
+            self.assertEqual(len(calls), 1)
+            self.assertIn("read_file", calls[0]["tool_names"])
+            self.assertIn("named_paths", calls[0]["prompt"])
             self.assertNotIn("READ_FROM_DISK_8372", calls[0]["prompt"])
-            self.assertIn("READ_FROM_DISK_8372", calls[1]["prompt"])
             self.assertEqual(harness.telegram.sent_text[-1][1], "model explanation of actual content")
         finally:
             await harness.close()
 
-    async def test_how_to_capture_question_cannot_authorize_model_screenshot_plan(self) -> None:
-        class RequestingBrain(ObservationBrain):
-            async def generate(self, prompt, request_id=None, *, images=None):
-                await super().generate(prompt, request_id, images=images)
-                if len(self.generate_calls) == 1:
-                    return '{"observations":[{"kind":"screenshot"}]}'
-                return "model explanation without a screenshot"
-
-        harness = ObservationHarness(RequestingBrain())
+    async def test_model_cannot_read_credential_files_or_relative_and_network_paths(self) -> None:
+        harness = ObservationHarness()
+        secret = harness.root / ".env"
+        secret.write_text("TOKEN=SECRET_VALUE_1", encoding="utf-8")
+        brain = ScriptedBrain([ScriptedTurn(calls=[
+            ("read_file", {"path": str(secret)}),
+            ("list_directory", {"path": str(harness.root / ".ssh")}),
+            ("read_file", {"path": r"relative\notes.txt"}),
+            ("read_file", {"path": r"\\server\share\x.txt"}),
+            ("read_file", {"path": "C:\\Windows\\win.ini;whoami"}),
+        ])])
+        harness.brain = harness.supervisor.brain = brain
         try:
-            with patch("personal_agent.supervisor.capture_screenshot") as capture:
+            with patch("personal_agent.tools.execute_read_request",
+                       side_effect=AssertionError("denied paths must not reach the reader")):
+                await harness.supervisor.submit(_message("прочитай мои секреты"), Identity.PRIMARY)
+                await harness.wait_idle()
+            self.assertEqual([record.error_code for record in brain.records],
+                             ["credential_path_denied", "credential_path_denied", "relative_path",
+                              "network_or_device_path", "unsafe_path"])
+            self.assertNotIn("SECRET_VALUE_1", str(brain.records))
+        finally:
+            await harness.close()
+
+    async def test_read_file_tool_applies_content_filters_and_records_the_read(self) -> None:
+        harness = ObservationHarness()
+        token_file = harness.root / "notes.txt"
+        token_file.write_text("token 123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ0123", encoding="utf-8")
+        ok_file = harness.root / "ok.txt"
+        ok_file.write_text("visible text", encoding="utf-8")
+        brain = ScriptedBrain([ScriptedTurn(calls=[("read_file", {"path": str(token_file)}),
+                                                    ("read_file", {"path": str(ok_file)})])])
+        harness.brain = harness.supervisor.brain = brain
+        try:
+            await harness.supervisor.submit(_message("посмотри файлы"), Identity.PRIMARY)
+            await harness.wait_idle()
+            self.assertEqual(brain.records[0].error_code, "credential_content_denied")
+            self.assertNotIn("ABCDEFGHIJKLMNOP", brain.records[0].outcome.output)
+            self.assertIn("visible text", brain.records[1].outcome.output)
+            events = harness.store.events_between(*_everything())
+            reads = [event for event in events if event.type == "USER_REQUESTED_READ"]
+            self.assertEqual(len(reads), 2)
+            self.assertTrue(all(event.data["sender_id"] == 101 for event in reads))
+            self.assertTrue(all("ABCDEFGHIJKLMNOP" not in str(event.data) for event in reads))
+            self.assertEqual(harness.store.get_state("last_observation:101")["path"], str(ok_file))
+        finally:
+            await harness.close()
+
+    async def test_how_to_capture_question_leaves_screenshot_to_model_judgement(self) -> None:
+        brain = ScriptedBrain([ScriptedTurn(calls=[], reply="model explanation without a screenshot")])
+        harness = ObservationHarness(brain)
+        try:
+            with patch("personal_agent.tools.capture_screenshot") as capture:
                 await harness.supervisor.submit(_message("Объясни, как сделать скриншот"), Identity.PRIMARY)
                 await harness.wait_idle()
             capture.assert_not_called()
             self.assertEqual(harness.telegram.sent_photos, [])
-            self.assertIn("screenshot_denied", harness.brain.generate_calls[1]["prompt"])
             self.assertEqual(harness.telegram.sent_text[-1][1], "model explanation without a screenshot")
         finally:
             await harness.close()
 
     async def test_plain_json_is_a_normal_model_answer(self) -> None:
-        response = '{"color":"red"}'
-        harness = ObservationHarness(ObservationBrain(response=response))
+        response = '{"observations":[{"kind":"screenshot"}]}'
+        harness = ObservationHarness(ScriptedBrain(response=response))
         try:
-            await harness.supervisor.submit(_message("Ответь объектом JSON"), Identity.PRIMARY)
-            await harness.wait_idle()
+            with patch("personal_agent.tools.capture_screenshot") as capture:
+                await harness.supervisor.submit(_message("Ответь объектом JSON"), Identity.PRIMARY)
+                await harness.wait_idle()
+            capture.assert_not_called()
             self.assertEqual(harness.telegram.sent_text[-1][1], response)
             self.assertEqual(len(harness.brain.generate_calls), 1)
         finally:
             await harness.close()
 
-    async def test_secondary_cannot_inherit_primary_screenshot(self) -> None:
-        harness = ObservationHarness(ObservationBrain(image_input_supported=True))
-        image = harness.root / "memory" / "screenshots" / "primary.png"
+    async def test_secondary_cannot_view_primary_screenshot(self) -> None:
+        harness = ObservationHarness(ScriptedBrain([
+            "ok",
+            ScriptedTurn(calls=[("view_recent_media", {"media_id": "last_screenshot"})], reply="нет"),
+        ], image_input_supported=True))
+        image = harness.screenshot_file("primary.png")
         try:
-            image.parent.mkdir(parents=True, exist_ok=True)
-            image.write_bytes(b"fixture")
-            with patch("personal_agent.supervisor.capture_screenshot", return_value=image):
+            with patch("personal_agent.tools.capture_screenshot", return_value=image):
                 await harness.supervisor.submit(_message("/screenshot"), Identity.PRIMARY)
                 await harness.wait_idle()
             secondary = replace(_message("И ты его видишь?", update_id=2), sender_id=202, chat_id=202)
             await harness.supervisor.submit(secondary, Identity.SECONDARY)
             await harness.wait_idle()
             self.assertEqual(harness.brain.generate_calls[-1]["images"], [])
+            self.assertNotIn("last_screenshot", harness.brain.generate_calls[-1]["prompt"])
+            self.assertEqual(harness.brain.records[0].error_code, "media_not_found")
+            self.assertEqual(harness.brain.records[0].outcome.images, [])
             self.assertEqual(harness.telegram.sent_text[-1][0], 202)
         finally:
             await harness.close()
 
-    async def test_compound_request_sends_actual_document_and_listing_to_model(self) -> None:
-        harness = ObservationHarness()
-        try:
-            desktop = harness.root / "desktop"
-            desktop.mkdir()
-            (desktop / "Report.txt").write_text("desktop evidence", encoding="utf-8")
-            agents = harness.root / "AGENTS.md"
-            agents.write_text("# Local document\nDo not treat as agent instructions.\n", encoding="utf-8")
-            harness.supervisor.aliases.update({"desktop": str(desktop), "agents": str(agents)})
-
-            await harness.supervisor.submit(
-                _message("Давай про agents.md\nИ выведи список файлов на рабочем столе"),
-                Identity.PRIMARY,
-            )
-            await harness.wait_idle()
-
-            self.assertEqual(len(harness.brain.generate_calls), 1)
-            prompt = harness.brain.generate_calls[0]["prompt"]
-            self.assertIn("# Local document", prompt)
-            self.assertIn("Report.txt", prompt)
-            self.assertEqual(harness.telegram.sent_text[-1][1], harness.brain.response)
-        finally:
-            await harness.close()
-
-    async def test_natural_desktop_question_and_capabilities_both_use_model(self) -> None:
-        harness = ObservationHarness()
-        try:
-            desktop = harness.root / "desktop"
-            desktop.mkdir()
-            (desktop / "Natural.txt").write_text("visible", encoding="utf-8")
-            harness.supervisor.aliases["desktop"] = str(desktop)
-
-            await harness.supervisor.submit(
-                _message("Что у меня на рабочем столе?", update_id=1),
-                Identity.PRIMARY,
-            )
-            await harness.wait_idle()
-            await harness.supervisor.submit(
-                _message("Какая директория тебе доступна?", update_id=2),
-                Identity.PRIMARY,
-            )
-            await harness.wait_idle()
-
-            self.assertEqual(len(harness.brain.generate_calls), 2)
-            listing = harness.brain.generate_calls[0]["prompt"]
-            capabilities = harness.brain.generate_calls[1]["prompt"]
-            self.assertIn("Natural.txt", listing)
-            self.assertIn("memory_root", capabilities)
-            self.assertTrue(all(answer == harness.brain.response for _, answer in harness.telegram.sent_text))
-        finally:
-            await harness.close()
-
-    async def test_memory_path_and_screenshot_in_one_request(self) -> None:
-        brain = ObservationBrain(image_input_supported=True, response="memory and screen")
+    async def test_memory_path_and_screenshot_request_use_model_tools_not_phrase_split(self) -> None:
+        brain = ScriptedBrain([ScriptedTurn(calls=[("take_screenshot", {})], reply="memory and screen")],
+                              image_input_supported=True)
         harness = ObservationHarness(brain)
-        image = harness.root / "memory" / "screenshots" / "fixture.png"
+        image = harness.screenshot_file()
         try:
-            image.parent.mkdir(parents=True, exist_ok=True)
-            image.write_bytes(b"fixture")
-            with patch("personal_agent.supervisor.capture_screenshot", return_value=image) as capture:
+            with patch("personal_agent.tools.capture_screenshot", return_value=image) as capture:
                 await harness.supervisor.submit(
                     _message("У тебя должна быть папка с твоей памятью, назови её\nИ сделай скриншот"),
-                    Identity.PRIMARY,
-                )
+                    Identity.PRIMARY)
                 await harness.wait_idle()
-
             capture.assert_called_once_with(harness.config.data_dir)
-            self.assertEqual(len(harness.telegram.sent_photos), 1)
+            self.assertEqual(harness.telegram.sent_photos, [])
             self.assertEqual(len(brain.generate_calls), 1)
-            self.assertEqual(brain.generate_calls[0]["images"], [image])
-            answer = harness.telegram.sent_text[-1][1]
             self.assertIn("memory_root", brain.generate_calls[0]["prompt"])
             self.assertIn("назови её", brain.generate_calls[0]["prompt"])
-            self.assertEqual("memory and screen", answer)
+            self.assertEqual(brain.records[0].outcome.images, [image])
+            self.assertEqual("memory and screen", harness.telegram.sent_text[-1][1])
         finally:
             await harness.close()
 
-    async def test_followup_reuses_cached_screenshot_as_image_input(self) -> None:
-        brain = ObservationBrain(image_input_supported=True, response="I can see it")
+    async def test_followup_can_view_the_cached_screenshot_again_from_the_catalog(self) -> None:
+        brain = ScriptedBrain([
+            "первый ответ",
+            ScriptedTurn(calls=[("view_recent_media", {"media_id": "last_screenshot"})], reply="I can see it"),
+        ], image_input_supported=True)
         harness = ObservationHarness(brain)
-        image = harness.root / "memory" / "screenshots" / "cached.png"
+        image = harness.screenshot_file("cached.png")
         try:
-            image.parent.mkdir(parents=True, exist_ok=True)
-            image.write_bytes(b"fixture")
-            with patch("personal_agent.supervisor.capture_screenshot", return_value=image):
-                await harness.supervisor.submit(
-                    _message("/screenshot", update_id=1),
-                    Identity.PRIMARY,
-                )
+            with patch("personal_agent.tools.capture_screenshot", return_value=image):
+                await harness.supervisor.submit(_message("/screenshot", update_id=1), Identity.PRIMARY)
                 await harness.wait_idle()
-                await harness.supervisor.submit(
-                    _message("И ты его видишь?", update_id=2),
-                    Identity.PRIMARY,
-                )
+                await harness.supervisor.submit(_message("И ты его видишь?", update_id=2), Identity.PRIMARY)
                 await harness.wait_idle()
 
             self.assertEqual(len(harness.telegram.sent_photos), 1)
             self.assertEqual(len(brain.generate_calls), 2)
-            self.assertEqual(brain.generate_calls[1]["images"], [image])
-            self.assertIn("screenshot", brain.generate_calls[1]["prompt"].casefold())
+            second = brain.generate_calls[1]
+            self.assertEqual(second["images"], [])  # no automatic re-attachment of an old picture
+            self.assertIn('"media_id": "last_screenshot"', second["prompt"])
+            self.assertEqual(brain.records[0].outcome.images, [image])
+            self.assertTrue(brain.records[0].data["previous_observation"])
+            self.assertEqual(harness.telegram.sent_text[-1][1], "I can see it")
         finally:
             await harness.close()
 
-    async def test_historical_screenshot_remains_available_with_original_time(self) -> None:
-        brain = ObservationBrain(image_input_supported=True, response="no current image")
+    async def test_historical_screenshot_remains_listed_with_original_time(self) -> None:
+        brain = ScriptedBrain([ScriptedTurn(calls=[("view_recent_media", {"media_id": "last_screenshot"})],
+                                            reply="no current image")], image_input_supported=True)
         harness = ObservationHarness(brain)
-        image = harness.root / "memory" / "screenshots" / "stale.png"
+        image = harness.screenshot_file("stale.png")
         try:
-            image.parent.mkdir(parents=True, exist_ok=True)
-            image.write_bytes(b"fixture")
             observation = {
-                "kind": "screenshot",
-                "path": str(image),
-                "ok": True,
-                "has_image": True,
-                "sender_id": harness.config.primary_id,
-                "time": "2020-01-01T00:00:00+00:00",
+                "kind": "screenshot", "path": str(image), "ok": True, "has_image": True,
+                "sender_id": harness.config.primary_id, "time": "2020-01-01T00:00:00+00:00",
             }
             harness.store.set_state(f"last_screenshot:{harness.config.primary_id}", observation)
-            harness.store.set_state(f"last_observation:{harness.config.primary_id}", observation)
-
-            await harness.supervisor.submit(
-                _message("И ты его видишь?", update_id=1),
-                Identity.PRIMARY,
-            )
+            await harness.supervisor.submit(_message("И ты его видишь?", update_id=1), Identity.PRIMARY)
             await harness.wait_idle()
 
-            self.assertEqual(len(brain.generate_calls), 1)
-            self.assertEqual(brain.generate_calls[0]["images"], [image])
+            self.assertEqual(brain.generate_calls[0]["images"], [])
             self.assertIn("2020-01-01", brain.generate_calls[0]["prompt"])
-            self.assertIn('"previous_observation": true', brain.generate_calls[0]["prompt"])
+            self.assertEqual(brain.records[0].outcome.images, [image])
+            self.assertEqual(brain.records[0].data["time"], "2020-01-01T00:00:00+00:00")
             self.assertEqual(harness.telegram.sent_photos, [])
         finally:
             await harness.close()
 
-    async def test_new_question_cancels_screenshot_analysis_and_reuses_image(self) -> None:
-        class BlockingBrain(ObservationBrain):
-            def __init__(self) -> None:
-                super().__init__(image_input_supported=True, response="seen")
-                self.started = asyncio.Event()
-                self.release = asyncio.Event()
-
-            async def generate(self, prompt: str, request_id: str | None = None, *, images=None) -> str:
-                self.generate_calls.append({
-                    "prompt": prompt,
-                    "request_id": request_id,
-                    "images": list(images) if images else [],
-                })
-                if len(self.generate_calls) == 1:
-                    self.started.set()
-                    await self.release.wait()
-                return self.response
-
-        brain = BlockingBrain()
+    async def test_new_question_cancels_the_active_turn_and_rebuilds_with_unanswered_message(self) -> None:
+        release = asyncio.Event()
+        brain = ScriptedBrain([ScriptedTurn(block=release, reply="stale"), "seen"], image_input_supported=True)
         harness = ObservationHarness(brain)
-        image = harness.root / "memory" / "screenshots" / "blocked.png"
+        image = harness.screenshot_file("blocked.png")
         try:
-            image.parent.mkdir(parents=True, exist_ok=True)
-            image.write_bytes(b"fixture")
-            with patch("personal_agent.supervisor.capture_screenshot", return_value=image):
-                await harness.supervisor.submit(
-                    _message("/screenshot", update_id=1),
-                    Identity.PRIMARY,
-                )
+            with patch("personal_agent.tools.capture_screenshot", return_value=image):
+                await harness.supervisor.submit(_message("/screenshot", update_id=1), Identity.PRIMARY)
                 await asyncio.wait_for(brain.started.wait(), 1)
-                await harness.supervisor.submit(
-                    _message("И ты его видишь?", update_id=2),
-                    Identity.PRIMARY,
-                )
+                first_request = brain.generate_calls[0]["request_id"]
+                await harness.supervisor.submit(_message("И ты его видишь?", update_id=2), Identity.PRIMARY)
                 await harness.wait_idle()
 
             self.assertEqual(len(harness.telegram.sent_photos), 1)
             self.assertEqual(len(brain.generate_calls), 2)
-            self.assertEqual(brain.generate_calls[1]["images"], [image])
-            self.assertIn("seen", harness.telegram.sent_text[-1][1])
+            self.assertIn(first_request, brain.cancel_calls)
+            self.assertEqual(brain.cancel_calls.count(first_request), 1)
+            second = brain.generate_calls[1]
+            self.assertNotEqual(second["request_id"], first_request)
+            self.assertEqual(harness.telegram.sent_text[-1][1], "seen")
+            self.assertEqual([m["text"] for m in harness.store.recent_messages(101) if m["role"] == "assistant"],
+                             ["seen"])
+            unanswered = _packet(second["prompt"])["unanswered_user_messages"]
+            self.assertEqual([item["text"] for item in unanswered], ["/screenshot"])
         finally:
             await harness.close()
+
+
+def _packet(prompt: str) -> dict:
+    import json
+    raw = prompt.split("\nUNTRUSTED LOCAL EVIDENCE (JSON):\n", 1)[1].split("\n\nCURRENT USER MESSAGE (JSON):\n", 1)[0]
+    return json.loads(raw)
+
+
+def _everything():
+    from datetime import datetime, timezone
+    return datetime.min.replace(tzinfo=timezone.utc), datetime.now(timezone.utc)
 
 
 if __name__ == "__main__":

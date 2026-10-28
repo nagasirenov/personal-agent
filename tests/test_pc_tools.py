@@ -115,7 +115,9 @@ class PcToolTests(unittest.IsolatedAsyncioTestCase):
         args, kwargs = spawn.call_args
         self.assertEqual(args, ("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
                                "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
-                               "$OutputEncoding = [Console]::OutputEncoding;\n" + command))
+                               "$OutputEncoding = [Console]::OutputEncoding; $ConfirmPreference = 'None'; "
+                               "$ProgressPreference = 'SilentlyContinue'; "
+                               "$PSDefaultParameterValues['Invoke-WebRequest:UseBasicParsing'] = $true;\n" + command))
         self.assertEqual(kwargs["env"], {"PATH": "test-path", "TEMP": str(self.root)})
         self.assertEqual(kwargs["creationflags"], subprocess.CREATE_NO_WINDOW)
         self.assertEqual(kwargs["cwd"], str(self.root))

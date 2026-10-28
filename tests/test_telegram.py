@@ -9,7 +9,7 @@ import httpx
 
 from personal_agent.models import EMERGENCY_PHRASE, Identity
 from personal_agent.security import TrustGate
-from personal_agent.telegram import TelegramClient, TelegramError, TelegramGateway
+from personal_agent.telegram import TelegramClient, TelegramError, TelegramGateway, parse_message
 
 
 PRIMARY_ID = 101
@@ -49,6 +49,59 @@ class GatewayClient:
 
 
 class TelegramGatewayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sticker_metadata_distinguishes_static_tgs_and_webm(self) -> None:
+        def sticker_update(sticker: dict, update_id: int) -> dict:
+            return {
+                "update_id": update_id,
+                "message": {
+                    "message_id": update_id,
+                    "from": {"id": PRIMARY_ID, "is_bot": False},
+                    "chat": {"id": PRIMARY_ID, "type": "private"},
+                    "sticker": dict({"file_id": f"sticker-{update_id}", "width": 512, "height": 512}, **sticker),
+                },
+            }
+
+        static = parse_message(sticker_update({"is_animated": False, "is_video": False, "emoji": "🙂"}, 10))
+        animated = parse_message(sticker_update({"is_animated": True, "is_video": False}, 11))
+        video = parse_message(sticker_update({"is_animated": False, "is_video": True}, 12))
+
+        self.assertEqual(static.attachment["sticker_format"], "webp")
+        self.assertFalse(static.attachment["is_animated"])
+        self.assertFalse(static.attachment["is_video"])
+        self.assertEqual(static.attachment["emoji"], "🙂")
+        self.assertEqual(animated.attachment["sticker_format"], "tgs")
+        self.assertTrue(animated.attachment["is_animated"])
+        self.assertEqual(video.attachment["sticker_format"], "webm")
+        self.assertTrue(video.attachment["is_video"])
+
+    async def test_parse_message_video_types(self) -> None:
+        def update_with(kind: str, payload: dict) -> dict:
+            return {
+                "update_id": 20,
+                "message": {
+                    "message_id": 20,
+                    "from": {"id": PRIMARY_ID, "is_bot": False},
+                    "chat": {"id": PRIMARY_ID, "type": "private"},
+                    kind: payload,
+                    "caption": "video caption",
+                },
+            }
+        video = parse_message(update_with("video", {"file_id": "v-1", "duration": 12, "file_name": "clip.mp4"}))
+        self.assertIsNotNone(video)
+        self.assertEqual(video.attachment["kind"], "video")
+        self.assertEqual(video.attachment["file_id"], "v-1")
+        self.assertEqual(video.text, "video caption")
+
+        note = parse_message(update_with("video_note", {"file_id": "vn-1", "duration": 8, "length": 240}))
+        self.assertIsNotNone(note)
+        self.assertEqual(note.attachment["kind"], "video_note")
+        self.assertEqual(note.attachment["file_id"], "vn-1")
+
+        anim = parse_message(update_with("animation", {"file_id": "anim-1", "duration": 4, "file_name": "loop.mp4"}))
+        self.assertIsNotNone(anim)
+        self.assertEqual(anim.attachment["kind"], "animation")
+        self.assertEqual(anim.attachment["file_id"], "anim-1")
+
     async def test_primary_emergency_phrase_in_attachment_caption_does_not_shutdown(self) -> None:
         store = StateStore()
         stop = asyncio.Event()

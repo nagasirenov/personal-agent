@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 import os
-import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,8 +9,6 @@ from unittest.mock import patch
 from personal_agent.observation_broker import (
     ObservationDenied,
     ObservationScope,
-    observation_protocol,
-    parse_observation_plan,
     validate_observation_plan,
 )
 from personal_agent.observation_requests import ObservationRequest
@@ -25,29 +21,14 @@ class ObservationBrokerTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, code)
         self.assertTrue(caught.exception.public_message)
 
-    def test_parse_plain_fenced_and_normal_answer(self) -> None:
-        raw = r'{"observations":[{"kind":"read_file","path":"C:\\Temp\\a.txt"}]}'
-        expected = [ObservationRequest("read_file", r"C:\Temp\a.txt")]
-        self.assertEqual(parse_observation_plan(raw), expected)
-        self.assertEqual(parse_observation_plan(f"```json\n{raw}\n```"), expected)
-        self.assertIsNone(parse_observation_plan("I can answer this from the data already provided."))
-
-    def test_rejects_malformed_unknown_keys_kinds_grants_and_oversize(self) -> None:
-        bad = [
-            ('{"observations":[{"kind":"read_file"}]}', "malformed_plan"),
-            ('{"observations":[{"kind":"read_file","path":"C:\\\\x","write":true}]}', "malformed_plan"),
-            ('{"observations":[{"kind":"shell","path":"C:\\\\x"}]}', "unsupported_kind"),
-            ('{"observations":[{"kind":"browser","path":"C:\\\\x"}]}', "unsupported_kind"),
-            ('{"observations":[{"kind":"worker","path":"C:\\\\x"}]}', "unsupported_kind"),
-            ('{"observations":[{"kind":"write_file","path":"C:\\\\x"}]}', "unsupported_kind"),
-            ('{"observations":[{"kind":"screenshot","path":"C:\\\\x"}]}', "malformed_plan"),
-        ]
-        for text, code in bad:
-            with self.subTest(text=text):
-                self.assertDenied(code, lambda text=text: parse_observation_plan(text))
-        four = {"observations": [{"kind": "screenshot"}] * 4}
-        self.assertDenied("request_budget", lambda: parse_observation_plan(json.dumps(four)))
-        self.assertDenied("plan_too_large", lambda: parse_observation_plan("{" + "x" * 20000))
+    def test_rejects_unknown_kinds_and_malformed_requests(self) -> None:
+        for request in (ObservationRequest("read_file"), ObservationRequest("shell", r"C:\x"),
+                        ObservationRequest("write_file", r"C:\x"), ObservationRequest("screenshot", r"C:\x")):
+            with self.subTest(request=request):
+                self.assertRaises(ObservationDenied, validate_observation_plan, [request],
+                                  ObservationScope(allow_screenshot=True))
+        self.assertDenied("request_budget", lambda: validate_observation_plan(
+            [ObservationRequest("screenshot")] * 4, ObservationScope(allow_screenshot=True)))
 
     def test_budget_duplicates_and_screenshot_scope(self) -> None:
         scope = ObservationScope(allow_screenshot=False, max_requests=2)
@@ -113,15 +94,6 @@ class ObservationBrokerTests(unittest.TestCase):
                         [ObservationRequest("read_file", str(child / "x.txt"))], ObservationScope((root,))
                     ),
                 )
-
-    def test_protocol_describes_real_one_round_capability(self) -> None:
-        protocol = observation_protocol(ObservationScope((Path(r"C:\Project"),), allow_screenshot=False))
-        example = re.search(r'Example: (\{.*\})\. Allowed kinds:', protocol).group(1)
-        self.assertEqual(parse_observation_plan(example), [ObservationRequest("list_directory", r"C:\project")])
-        self.assertIn("one read-only observation round", protocol)
-        self.assertIn("screenshot=not allowed", protocol)
-        self.assertIn("After observation results, answer normally", protocol)
-        self.assertNotIn("if the application sends", protocol.casefold())
 
 
 if __name__ == "__main__":

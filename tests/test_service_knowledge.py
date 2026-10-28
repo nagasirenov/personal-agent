@@ -7,7 +7,7 @@ from pathlib import Path
 from personal_agent.config import Config
 from personal_agent.memory import MemoryStore
 from personal_agent.self_knowledge import (
-    PUBLIC_RULES, ServiceKnowledge, remember_preferences, wants_diagnostics,
+    PUBLIC_RULES, ServiceKnowledge, remember_preferences,
 )
 
 PRIMARY_ID = 101
@@ -63,6 +63,11 @@ class ServiceKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(facts["host_coding_instructions"])
         self.assertFalse(facts["subagent_orchestration"])
         self.assertFalse(facts["environment_actions"])
+        self.assertTrue(facts["pc_tools"]["screenshot_on_request"])
+        self.assertTrue(facts["pc_tools"]["read_active_window_on_request"])
+        self.assertTrue(facts["pc_tools"]["read_browser_page_on_request"])
+        self.assertFalse(facts["pc_tools"]["run_command"])
+        self.assertFalse(facts["pc_tools"]["write_file"])
         self.assertEqual(self.brain.health_calls, 0)
         self.assertEqual(self.brain.generate_calls, 0)
 
@@ -79,8 +84,12 @@ class ServiceKnowledgeTests(unittest.IsolatedAsyncioTestCase):
     def test_updated_preferences_remain_account_scoped(self) -> None:
         self.knowledge.facts(PRIMARY_ID)
         self.knowledge.facts(SECONDARY_ID)
-        remember_preferences(self.store, PRIMARY_ID, "Пиши попроще.")
-        remember_preferences(self.store, SECONDARY_ID, "Обращайся на ты.")
+        remember_preferences(
+            self.store, PRIMARY_ID, "Пиши попроще.", semantic_update={"tone": "friendly"}
+        )
+        remember_preferences(
+            self.store, SECONDARY_ID, "Обращайся на ты.", semantic_update={"address": "informal"}
+        )
         self.assertEqual(
             self.knowledge.facts(PRIMARY_ID)["conversation_preferences"],
             {"tone": "friendly"},
@@ -92,7 +101,7 @@ class ServiceKnowledgeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_conversation_and_descriptive_commands_are_never_intercepted(self) -> None:
         texts = (
-            "/start", "/model", "/instructions", "/memory", "/capabilities",
+            "/start", "/model", "/instructions", "/memory", "/capabilities", "/help",
             "Кто ты?", "Какая у тебя модель?", "Какие твои инструкции?",
             "Где твоя память?", "Что ты можешь?", "Это написано в AGENTS.md?",
             "Какая директория тебе доступна?", "Дай ему уже доступы",
@@ -137,27 +146,38 @@ class ServiceKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved["model"], "gpt-6.1-sol")
         self.assertEqual(saved["backend"], "codex_subscription")
 
-    async def test_help_reports_command_reference_without_health_or_generation(self) -> None:
-        report = await self.knowledge.command_report("/help")
-        self.assertIsNotNone(report)
-        for command in ("/model", "/instructions", "/capabilities", "/memory",
-                        "/status", "/diagnostics", "/ls", "/read", "/screenshot"):
-            with self.subTest(command=command):
-                self.assertIn(command, report)
+    async def test_help_is_not_intercepted_as_a_canned_report(self) -> None:
+        self.assertIsNone(await self.knowledge.command_report("/help"))
         self.assertEqual(self.brain.health_calls, 0)
         self.assertEqual(self.brain.generate_calls, 0)
 
-    async def test_natural_diagnostics_select_data_without_intercepting_reply(self) -> None:
-        for text in ("Проведи самодиагностику", "Проведи диагностику",
-                     "Проверь себя", "Проверь своё состояние"):
+    async def test_natural_diagnostics_are_not_phrase_routed(self) -> None:
+        for text in ("Проведи самодиагностику", "Проверь себя", "Как у тебя с соединением?",
+                     "Проверь своё состояние", "Расскажи о диагностике автомобиля"):
             with self.subTest(text=text):
-                self.assertTrue(wants_diagnostics(text))
                 self.assertIsNone(await self.knowledge.command_report(text))
-        for text in ("Кто ты?", "Где твоя память?", "Расскажи о диагностике автомобиля"):
-            with self.subTest(text=text):
-                self.assertFalse(wants_diagnostics(text))
         self.assertEqual(self.brain.health_calls, 0)
         self.assertEqual(self.brain.generate_calls, 0)
+
+    async def test_model_probe_is_bounded_and_never_exposes_raw_health(self) -> None:
+        self.store.increment_metric("cloud_calls_today", 3)
+        self.store.set_state("observer_health", {"available": False, "last_error": "private-token",
+                          "last_sample_time": "Bearer private-token",
+                          "watch_errors": {"C:\\secret\\project": "leak"},
+                          "agent_sources": {"codex": {"available": False, "error_type": "AccessDenied",
+                                                      "path": "C:\\private"}}})
+        self.store.set_state("last_turn_error", {"code": "rate_limited", "detail": "Bearer private-key"})
+        self.store.set_state("telegram_health", None)
+        result = await self.knowledge.model_diagnostic_facts()
+        self.assertFalse(result["observer"]["available"])
+        self.assertIsNone(result["observer"]["last_sample_time"])
+        self.assertIsNone(result["telegram_polling"]["ok_last_recorded"])
+        self.assertEqual(result["last_turn_error_code"], "rate_limited")
+        self.assertEqual(result["usage_today_utc"]["cloud_calls_today"], 3)
+        self.assertEqual(result["observer"]["sources"]["codex"]["error_type"], "AccessDenied")
+        serialized = str(result)
+        for secret in ("private-token", "C:\\secret", "C:\\private", "Bearer private-key"):
+            self.assertNotIn(secret, serialized)
 
 
 if __name__ == "__main__":

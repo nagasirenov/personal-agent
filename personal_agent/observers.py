@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import ctypes
 import os
+import queue
+import re
 import sys
+import threading
 from collections import Counter
 from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
@@ -28,6 +31,7 @@ _EXCLUDED_DIRS = {
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
+    ".state",
     ".tox",
     ".venv",
     "__pycache__",
@@ -205,6 +209,38 @@ class _Win32Sampler:
             self.kernel32.CloseHandle(handle)
 
 
+class _ProjectFileEventHandler:
+    def __init__(self, owner: "WindowsActivityObserver", project: str, root: Path) -> None:
+        self.owner = owner
+        self.project = project
+        self.root = root
+
+    def dispatch(self, event: Any) -> None:
+        callback = getattr(self, f"on_{getattr(event, 'event_type', '')}", None)
+        if callback is not None:
+            callback(event)
+
+    def _record(self, event: Any, kind: str, attribute: str = "src_path") -> None:
+        if bool(getattr(event, "is_directory", False)):
+            return
+        path = getattr(event, attribute, None)
+        if path:
+            self.owner._queue_path_change(self.project, self.root, str(path), kind)
+
+    def on_created(self, event: Any) -> None:
+        self._record(event, "created")
+
+    def on_modified(self, event: Any) -> None:
+        self._record(event, "modified")
+
+    def on_deleted(self, event: Any) -> None:
+        self._record(event, "deleted")
+
+    def on_moved(self, event: Any) -> None:
+        self._record(event, "deleted", "src_path")
+        self._record(event, "created", "dest_path")
+
+
 class WindowsActivityObserver:
     def __init__(
         self,
@@ -214,20 +250,37 @@ class WindowsActivityObserver:
         snapshot_provider: Callable[[], dict[str, Any]] | None = None,
         clock: Callable[[], datetime] | None = None,
         max_files: int = 10_000,
+        event_queue_size: int | None = None,
+        watchdog_loader: Callable[[], type[Any]] | None = None,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive")
         self.project_roots = {name: Path(path) for name, path in project_roots.items()}
         self.interval_seconds = float(interval_seconds)
         self.max_files = max(1, int(max_files))
+        self.event_queue_size = max(
+            1,
+            int(self.max_files if event_queue_size is None else event_queue_size),
+        )
         self._snapshot_provider = snapshot_provider
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._watchdog_loader = watchdog_loader
         self._win32: _Win32Sampler | None = None
         self._previous: dict[str, Any] | None = None
         self._samples = 0
         self._last_sample_time: datetime | None = None
         self._last_error: str | None = None
         self._truncated_projects: list[str] = []
+        self._file_queue: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=self.event_queue_size)
+        self._file_queue_lock = threading.Lock()
+        self._queued_paths: set[tuple[str, str]] = set()
+        self._pending_file_changes: dict[tuple[str, str], str] = {}
+        self._dropped_file_events = 0
+        self._coalesced_file_events = 0
+        self._watchdog_observer: Any | None = None
+        self._watched_projects: list[str] = []
+        self._watch_errors: dict[str, str] = {}
+        self._file_observer_started = False
 
     def detect(self) -> bool:
         return self._snapshot_provider is not None or sys.platform == "win32"
@@ -241,66 +294,229 @@ class WindowsActivityObserver:
         if self._snapshot_provider is not None:
             return self._snapshot_provider()
         native = self._native()
-        files, truncated = self._scan_projects()
-        self._truncated_projects = truncated
         return {
             "foreground": native.foreground(),
             "idle_seconds": native.idle_seconds(),
             "processes": native.processes(),
-            "files": files,
         }
 
-    def _scan_projects(self) -> tuple[dict[str, dict[str, tuple[int, int]]], list[str]]:
-        all_projects: dict[str, dict[str, tuple[int, int]]] = {}
-        truncated: list[str] = []
-        remaining = self.max_files
-        entry_budget = self.max_files * 2
-        for project, root in sorted(self.project_roots.items()):
-            observed: dict[str, tuple[int, int]] = {}
-            if remaining <= 0 or entry_budget <= 0:
-                truncated.append(project)
-                all_projects[project] = observed
-                continue
-            try:
-                root_path = root.resolve()
-            except OSError:
-                all_projects[project] = observed
-                continue
-            stack = [root_path]
-            while stack and remaining > 0 and entry_budget > 0:
-                directory = stack.pop()
+    @staticmethod
+    def _load_watchdog_observer() -> type[Any]:
+        try:
+            from watchdog.observers import Observer
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "watchdog is required for event-based project file observation"
+            ) from exc
+        return Observer
+
+    def start(self) -> None:
+        if self._file_observer_started:
+            return
+        if self._snapshot_provider is not None:
+            self._file_observer_started = True
+            return
+
+        observer: Any | None = None
+        try:
+            observer_type = (
+                self._watchdog_loader()
+                if self._watchdog_loader is not None
+                else self._load_watchdog_observer()
+            )
+            observer = observer_type()
+            watched_projects: list[str] = []
+            watch_errors: dict[str, str] = {}
+            for project, root in sorted(self.project_roots.items()):
                 try:
-                    with os.scandir(directory) as iterator:
-                        from itertools import islice
-                        entries = list(islice(iterator, entry_budget + 1))
-                        if len(entries) > entry_budget:
-                            truncated.append(project)
-                            entries = entries[:entry_budget]
-                        entries.sort(key=lambda item: item.name.casefold(), reverse=True)
-                except (OSError, PermissionError):
+                    root_path = root.resolve()
+                    if not root_path.is_dir():
+                        raise FileNotFoundError(str(root_path))
+                    handler = _ProjectFileEventHandler(self, project, root_path)
+                    observer.schedule(handler, str(root_path), recursive=True)
+                    watched_projects.append(project)
+                except Exception as exc:
+                    watch_errors[project] = f"{type(exc).__name__}: {exc}"
+            observer.start()
+        except Exception as exc:
+            if observer is not None:
+                try:
+                    observer.stop()
+                    observer.join(timeout=5.0)
+                except Exception:
+                    pass
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            raise
+
+        self._watchdog_observer = observer
+        self._watched_projects = watched_projects
+        self._watch_errors = watch_errors
+        self._file_observer_started = True
+        self._last_error = None
+
+    def stop(self) -> None:
+        observer = self._watchdog_observer
+        self._file_observer_started = False
+        self._watchdog_observer = None
+        if observer is None:
+            return
+        try:
+            observer.stop()
+            observer.join(timeout=5.0)
+            is_alive = getattr(observer, "is_alive", None)
+            if callable(is_alive) and is_alive():
+                self._last_error = "RuntimeError: watchdog observer did not stop within 5 seconds"
+        except Exception as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+
+    @staticmethod
+    def _merge_file_change(previous: str | None, current: str) -> str | None:
+        if previous is None:
+            return current
+        if previous == "created":
+            return None if current == "deleted" else "created"
+        if previous == "deleted":
+            return "modified" if current == "created" else "deleted"
+        if current == "deleted":
+            return "deleted"
+        return "modified"
+
+    @staticmethod
+    def _relative_file_path(root: Path, path: str) -> str | None:
+        try:
+            relative = os.path.relpath(os.path.abspath(path), os.path.abspath(root))
+        except (OSError, ValueError):
+            return None
+        if (
+            relative == os.pardir
+            or relative.startswith(os.pardir + os.sep)
+            or os.path.isabs(relative)
+        ):
+            return None
+        parts = Path(relative).parts
+        if any(part.casefold() in _EXCLUDED_DIRS for part in parts[:-1]):
+            return None
+        return relative
+
+    def _queue_path_change(self, project: str, root: Path, path: str, kind: str) -> None:
+        relative = self._relative_file_path(root, path)
+        if relative is None:
+            return
+        key = (project, relative)
+        with self._file_queue_lock:
+            previous = self._pending_file_changes.get(key)
+            merged = self._merge_file_change(previous, kind)
+            if key in self._queued_paths:
+                self._coalesced_file_events += 1
+                if merged is None:
+                    self._pending_file_changes.pop(key, None)
+                else:
+                    self._pending_file_changes[key] = merged
+                return
+            if merged is None:
+                return
+            try:
+                self._file_queue.put_nowait(key)
+            except queue.Full:
+                self._dropped_file_events += 1
+                return
+            self._queued_paths.add(key)
+            self._pending_file_changes[key] = merged
+
+    def _timeline_file_event(
+        self,
+        project: str,
+        relative: str,
+        kind: str,
+        when: datetime,
+    ) -> TimelineEvent | None:
+        event_type = kind
+        data: dict[str, Any] = {"path": relative}
+        if kind != "deleted":
+            root = self.project_roots.get(project)
+            if root is None:
+                return None
+            try:
+                stat = (root / relative).stat()
+            except FileNotFoundError:
+                event_type = "deleted"
+            except OSError:
+                return None
+            else:
+                data["mtime_ns"] = int(stat.st_mtime_ns)
+                data["size"] = int(stat.st_size)
+        return TimelineEvent(
+            source="filesystem",
+            type=f"file.{event_type}",
+            data=data,
+            project=project,
+            time=when,
+        )
+
+    def _drain_file_events(self, when: datetime) -> list[TimelineEvent]:
+        result: list[TimelineEvent] = []
+        for _ in range(self._file_queue.qsize()):
+            try:
+                key = self._file_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                with self._file_queue_lock:
+                    self._queued_paths.discard(key)
+                    kind = self._pending_file_changes.pop(key, None)
+                if kind is None:
                     continue
-                for entry in entries:
-                    entry_budget -= 1
-                    if entry.name.casefold() in _EXCLUDED_DIRS:
-                        continue
-                    try:
-                        if os.path.isjunction(entry.path):
-                            continue
-                        if entry.is_dir(follow_symlinks=False):
-                            stack.append(Path(entry.path))
-                        elif entry.is_file(follow_symlinks=False):
-                            stat = entry.stat(follow_symlinks=False)
-                            relative = os.path.relpath(entry.path, root_path)
-                            observed[relative] = (int(stat.st_mtime_ns), int(stat.st_size))
-                            remaining -= 1
-                            if remaining <= 0:
-                                break
-                    except (OSError, PermissionError):
-                        continue
-            if stack or remaining <= 0 or entry_budget <= 0:
-                truncated.append(project)
-            all_projects[project] = observed
-        return all_projects, sorted(set(truncated))
+                event = self._timeline_file_event(key[0], key[1], kind, when)
+                if event is not None:
+                    result.append(event)
+            finally:
+                self._file_queue.task_done()
+        return result
+
+    @staticmethod
+    def _snapshot_file_events(
+        current_files: dict[str, Any],
+        previous_files: dict[str, Any],
+        when: datetime,
+    ) -> list[TimelineEvent]:
+        result: list[TimelineEvent] = []
+        for project in sorted(set(current_files) | set(previous_files)):
+            new = current_files.get(project, {}) or {}
+            old = previous_files.get(project, {}) or {}
+            for path in sorted(old.keys() - new.keys()):
+                result.append(
+                    TimelineEvent(
+                        source="filesystem",
+                        type="file.deleted",
+                        data={"path": path},
+                        project=project,
+                        time=when,
+                    )
+                )
+            for path in sorted(new.keys() - old.keys()):
+                mtime_ns, size = new[path]
+                result.append(
+                    TimelineEvent(
+                        source="filesystem",
+                        type="file.created",
+                        data={"path": path, "mtime_ns": mtime_ns, "size": size},
+                        project=project,
+                        time=when,
+                    )
+                )
+            for path in sorted(new.keys() & old.keys()):
+                if tuple(new[path]) != tuple(old[path]):
+                    mtime_ns, size = new[path]
+                    result.append(
+                        TimelineEvent(
+                            source="filesystem",
+                            type="file.modified",
+                            data={"path": path, "mtime_ns": mtime_ns, "size": size},
+                            project=project,
+                            time=when,
+                        )
+                    )
+        return result
 
     def _project_for_foreground(self, foreground: dict[str, Any] | None) -> str | None:
         if not foreground:
@@ -409,44 +625,13 @@ class WindowsActivityObserver:
                     )
 
             current_files = current.get("files") if isinstance(current.get("files"), dict) else {}
-            if previous is not None:
+            if previous is not None and (
+                "files" in current or isinstance(previous.get("files"), dict)
+            ):
                 previous_files = previous.get("files") if isinstance(previous.get("files"), dict) else {}
-                for project in sorted(set(current_files) | set(previous_files)):
-                    new = current_files.get(project, {}) or {}
-                    old = previous_files.get(project, {}) or {}
-                    for path in sorted(old.keys() - new.keys()):
-                        result.append(
-                            TimelineEvent(
-                                source="filesystem",
-                                type="file.deleted",
-                                data={"path": path},
-                                project=project,
-                                time=when,
-                            )
-                        )
-                    for path in sorted(new.keys() - old.keys()):
-                        mtime_ns, size = new[path]
-                        result.append(
-                            TimelineEvent(
-                                source="filesystem",
-                                type="file.created",
-                                data={"path": path, "mtime_ns": mtime_ns, "size": size},
-                                project=project,
-                                time=when,
-                            )
-                        )
-                    for path in sorted(new.keys() & old.keys()):
-                        if tuple(new[path]) != tuple(old[path]):
-                            mtime_ns, size = new[path]
-                            result.append(
-                                TimelineEvent(
-                                    source="filesystem",
-                                    type="file.modified",
-                                    data={"path": path, "mtime_ns": mtime_ns, "size": size},
-                                    project=project,
-                                    time=when,
-                                )
-                            )
+                result.extend(self._snapshot_file_events(current_files, previous_files, when))
+            elif "files" not in current:
+                result.extend(self._drain_file_events(when))
 
             self._previous = current
             self._samples += 1
@@ -466,15 +651,36 @@ class WindowsActivityObserver:
         previous = self._previous or {}
         files = previous.get("files") if isinstance(previous.get("files"), dict) else {}
         tracked_files = sum(len(items or {}) for items in files.values())
+        with self._file_queue_lock:
+            pending_file_events = len(self._pending_file_changes)
+            dropped_file_events = self._dropped_file_events
+            coalesced_file_events = self._coalesced_file_events
+        observer_alive: bool | None = None
+        if self._watchdog_observer is not None:
+            is_alive = getattr(self._watchdog_observer, "is_alive", None)
+            if callable(is_alive):
+                observer_alive = bool(is_alive())
+        last_error = self._last_error
+        if self._file_observer_started and observer_alive is False and last_error is None:
+            last_error = "RuntimeError: watchdog observer thread is not running"
         return {
             "available": self.detect(),
             "samples": self._samples,
             "last_sample_time": self._last_sample_time.isoformat() if self._last_sample_time else None,
-            "last_error": self._last_error,
+            "last_error": last_error,
             "tracked_processes": len(self._normalize_processes(previous.get("processes"))),
             "tracked_files": tracked_files,
             "truncated_projects": list(self._truncated_projects),
             "interval_seconds": self.interval_seconds,
+            "file_observer_backend": "watchdog",
+            "file_observer_started": self._file_observer_started,
+            "file_observer_alive": observer_alive,
+            "watched_projects": list(self._watched_projects),
+            "watch_errors": dict(self._watch_errors),
+            "pending_file_events": pending_file_events,
+            "file_event_queue_capacity": self.event_queue_size,
+            "dropped_file_events": dropped_file_events,
+            "coalesced_file_events": coalesced_file_events,
         }
 
 
@@ -563,8 +769,11 @@ def sessionize(events: list[TimelineEvent]) -> list[dict[str, Any]]:
 
 
 def summarize_activity(events: list[TimelineEvent]) -> str:
-    sessions = sessionize(events)
-    if not sessions:
+    worker_sources = {"codex", "opencode", "vscode", "terminal", "browser"}
+    worker_events = [event for event in events if event.source in worker_sources]
+    desktop_events = [event for event in events if event.source not in worker_sources]
+    sessions = sessionize(desktop_events)
+    if not sessions and not worker_events:
         return "No activity evidence was recorded."
     lines: list[str] = []
     by_id = {event.id: event for event in events}
@@ -601,4 +810,121 @@ def summarize_activity(events: list[TimelineEvent]) -> str:
         if files:
             statement += ". Files changed: " + ", ".join(files[-8:])
         lines.append(f"{start}-{end} UTC: {statement}. Evidence: {evidence}.")
+    worker_groups: dict[tuple[str, str], list[TimelineEvent]] = {}
+    for event in sorted(worker_events, key=lambda item: (item.time, item.id)):
+        session_id = str(event.data.get("session_id") or event.project or "unknown")[:100]
+        worker_groups.setdefault((event.source, session_id), []).append(event)
+    for (source, _session_id), group in sorted(
+        worker_groups.items(), key=lambda item: item[1][-1].time
+    )[-12:]:
+        label = {"codex": "Codex", "opencode": "OpenCode", "vscode": "VS Code", "terminal": "Terminal", "browser": "Browser"}[source]
+        first, last = group[0], group[-1]
+        task = next((str(event.data.get("task", "")).strip() for event in group
+                     if isinstance(event.data.get("task"), str) and event.data["task"].strip()), "")
+        task = _safe_worker_text(task, 240)
+        project = next((event.project for event in reversed(group) if event.project), None)
+        kinds = Counter(event.type.rsplit(".", 1)[-1] for event in group)
+        status = next((str(event.data.get("status", "")).strip().casefold()
+                       for event in reversed(group) if event.data.get("status")), "")
+        details: list[str] = []
+        if task:
+            details.append(task)
+        if project:
+            details.append(f"project {Path(project).name or project}")
+        counts = []
+        commands = sum(count for kind, count in kinds.items() if "command" in kind or "tool" in kind)
+        changes = sum(count for kind, count in kinds.items() if "file" in kind or "change" in kind)
+        if commands:
+            counts.append(f"{commands} command/tool events")
+        if changes:
+            counts.append(f"{changes} file/change events")
+        if counts:
+            details.append(", ".join(counts))
+        if status:
+            details.append(f"latest status {status[:40]}")
+        if source == "vscode":
+            active_file = _safe_worker_path(str(last.data.get("active_file", "")), 512)
+            branch = _safe_worker_text(str(last.data.get("git_branch", "")), 100)
+            if active_file:
+                details.append(f"active file {active_file}")
+            if isinstance(last.data.get("open_file_count"), int):
+                details.append(f"{max(0, last.data['open_file_count'])} open files")
+            diagnostics = last.data.get("diagnostics")
+            if isinstance(diagnostics, dict):
+                errors = diagnostics.get("error", 0)
+                warnings = diagnostics.get("warning", 0)
+                if isinstance(errors, int) and isinstance(warnings, int) and (errors or warnings):
+                    details.append(f"diagnostics {errors} errors, {warnings} warnings")
+            if branch:
+                details.append(f"Git branch {branch}")
+            if isinstance(last.data.get("terminal_count"), int) and last.data["terminal_count"]:
+                details.append(f"{last.data['terminal_count']} terminals open")
+        elif source == "terminal":
+            process = _safe_worker_text(str(last.data.get("process", "")), 80)
+            cwd = _safe_worker_path(str(last.data.get("process_cwd", "")), 512)
+            command = _safe_worker_text(str(last.data.get("command_line", "")), 300)
+            children = last.data.get("child_processes")
+            if process:
+                details.append(f"process {process}")
+            if children:
+                child_names = children if isinstance(children, list) else [children]
+                names = [_safe_worker_text(str(item), 60) for item in child_names[:6]]
+                if names:
+                    details.append("children " + ", ".join(name for name in names if name))
+            if cwd:
+                details.append(f"native process cwd {cwd} (shell location may differ)")
+            elif last.data.get("process_cwd_status") == "unavailable":
+                details.append("native process cwd unavailable")
+            if command:
+                details.append(f"process launch command line {command}")
+            elif last.data.get("command_line_status") == "unavailable":
+                details.append("process command line unavailable")
+            child_details = last.data.get("child_details")
+            if isinstance(child_details, list):
+                for child in child_details[:3]:
+                    if not isinstance(child, dict):
+                        continue
+                    child_command = child.get("command_line")
+                    name = _safe_worker_text(str(child.get("process", "")), 80)
+                    if isinstance(child_command, str) and child_command:
+                        details.append(f"running child {name} command line {_safe_worker_text(child_command, 300)}")
+                    child_cwd = child.get("process_cwd")
+                    if isinstance(child_cwd, str) and child_cwd:
+                        details.append(f"child {name} native process cwd {_safe_worker_path(child_cwd, 512)}")
+        elif source == "browser":
+            title = _safe_worker_text(str(last.data.get("title", "")), 200)
+            url = _safe_worker_text(str(last.data.get("url", "")), 500)
+            if title:
+                details.append(f"page {title}")
+            if url:
+                details.append(f"URL {url}")
+            if isinstance(last.data.get("page_text_length"), int):
+                details.append(f"readable text {max(0, last.data['page_text_length'])} chars")
+            if isinstance(last.data.get("selected_text_length"), int) and last.data["selected_text_length"]:
+                details.append(f"selection {max(0, last.data['selected_text_length'])} chars")
+        start = first.time.astimezone(timezone.utc).strftime("%H:%M")
+        end = last.time.astimezone(timezone.utc).strftime("%H:%M")
+        description = "; ".join(details) if details else f"{len(group)} activity events"
+        lines.append(f"{start}-{end} UTC: {label} activity: {description}.")
     return "\n".join(lines)
+
+
+_WORKER_SECRET_PATTERNS = (
+    re.compile(r"(?i)\b\d{5,}:[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"(?i)\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|xox[baprs]-[A-Za-z0-9-]{12,})\b"),
+    re.compile(r"(?i)\b(?:token|password|secret|api[_ -]?key)\s*[:=]\s*\S+"),
+)
+
+
+def _safe_worker_text(value: str, limit: int) -> str:
+    value = " ".join(value.replace("\x00", " ").split())
+    for pattern in _WORKER_SECRET_PATTERNS:
+        value = pattern.sub("[redacted]", value)
+    return value[:limit]
+
+
+def _safe_worker_path(value: str, limit: int) -> str:
+    value = value.replace("\x00", " ").replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    for pattern in _WORKER_SECRET_PATTERNS:
+        value = pattern.sub("[redacted]", value)
+    return value[:limit]

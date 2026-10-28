@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from personal_agent.backends import BackendError, CodexSubscriptionBackend  # noqa: E402
+from personal_agent.backends import BackendError, CodexSubscriptionBackend, resolve_codex_command  # noqa: E402
+from personal_agent.brain_gateway import ToolOutcome  # noqa: E402
 
 
 class _CaptureServer(ThreadingHTTPServer):
@@ -195,15 +196,29 @@ def _tool_labels(value: object) -> list[str]:
     return labels
 
 
-async def _invoke(base_url: str, work_root: Path, prompt: str) -> str | None:
+NATIVE_TOOLS = [
+    {"type": "function", "name": "isolation_probe_alpha", "description": "Synthetic probe tool.",
+     "parameters": {"type": "object", "properties": {}}, "strict": False},
+    {"type": "function", "name": "isolation_probe_beta", "description": "Synthetic probe tool.",
+     "parameters": {"type": "object", "properties": {}}, "strict": False},
+]
+
+
+async def _unused_tool_handler(name: str, arguments: dict, call_id: str) -> ToolOutcome:
+    return ToolOutcome("{}")
+
+
+async def _invoke(base_url: str, work_root: Path, prompt: str, tools: list[dict] | None = None) -> str | None:
     backend = _LoopbackCaptureBackend(
         base_url,
-        model="gpt-6-sol",
-        reasoning_effort="high",
+        model="gpt-6-luna",
+        reasoning_effort="medium",
         work_root=work_root,
+        codex_command=resolve_codex_command("codex"),
     )
     try:
-        await backend.generate(prompt, "isolation-wire-capture")
+        await backend.generate(prompt, "isolation-wire-capture",
+                               **({"tools": tools, "tool_handler": _unused_tool_handler} if tools else {}))
     except BackendError as exc:
         return exc.code
     finally:
@@ -211,7 +226,7 @@ async def _invoke(base_url: str, work_root: Path, prompt: str) -> str | None:
     return None
 
 
-def main() -> int:
+def run_case(tools_passed: list[dict] | None = None) -> int:
     run_id = uuid4().hex
     synthetic_marker = f"PERSONAL_AGENT_SYNTHETIC_AGENTS_{run_id}"
     prompt = f"PERSONAL_AGENT_ISOLATION_PROMPT_{run_id}"
@@ -230,7 +245,7 @@ def main() -> int:
             )
             base_url = f"http://127.0.0.1:{server.server_port}/v1"
             backend_error = asyncio.run(
-                _invoke(base_url, controlled_parent, prompt)
+                _invoke(base_url, controlled_parent, prompt, tools_passed)
             )
     finally:
         server.shutdown()
@@ -293,7 +308,12 @@ def main() -> int:
 
     checks = {
         "authorization_header_absent": "authorization" not in headers,
-        "tools_empty": tools is None or tools == [],
+        "tools_match_exactly_what_was_passed": (
+            (tools is None or tools == []) if not tools_passed
+            else tool_labels == [t["name"] for t in tools_passed]
+            and body.get("tool_choice") == "auto"
+            and body.get("include") == ["reasoning.encrypted_content"]
+        ),
         "synthetic_agents_marker_absent": synthetic_marker not in serialized,
         "host_agents_content_absent": host_agents_matches == 0,
         "agents_instruction_frame_absent": "# AGENTS.md" not in serialized,
@@ -304,6 +324,7 @@ def main() -> int:
         "only_persona_and_prompt_messages": unexpected_message_count == 0,
     }
 
+    print(f"case={'native_tools' if tools_passed else 'no_tools'}")
     print(f"request_path={captured['path']}")
     print(f"content_encoding={headers.get('content-encoding', 'identity') or 'identity'}")
     print(f"body_sha256={hashlib.sha256(decoded).hexdigest()}")
@@ -335,6 +356,11 @@ def main() -> int:
         return 1
     print("PASS: captured Codex Responses payload is isolated.")
     return 0
+
+
+def main() -> int:
+    results = [run_case(None), run_case(NATIVE_TOOLS)]
+    return 1 if any(results) else 0
 
 
 if __name__ == "__main__":

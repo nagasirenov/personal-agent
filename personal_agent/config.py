@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 import tomllib
@@ -31,6 +32,11 @@ class Config:
     whisper_executable: str = ""
     whisper_model: str = ""
     ffmpeg_executable: str = ""
+    # Bot API server: the hosted one caps bot uploads at 50 MB; a local server (telegram-bot-api) allows 2000 MB.
+    telegram_api_base: str = "https://api.telegram.org"
+    # Files too big for Telegram go to Google Drive through rclone: "gdrive:PersonalAgent" (empty = split instead).
+    drive_remote: str = ""
+    rclone_executable: str = ""
 
     @property
     def tz(self) -> tzinfo:
@@ -63,6 +69,10 @@ class Config:
             raise ValueError("Invalid task bounds")
         if not 1 <= self.max_attachment_bytes <= 20 * 1024 * 1024:
             raise ValueError("Attachment limit must be at most 20 MiB for the hosted Bot API")
+        if not re.fullmatch(r"https?://[^\s/?#]+(?:/[^\s?#]*)?", self.telegram_api_base):
+            raise ValueError("telegram_api_base must be an http(s) URL")
+        if self.drive_remote and not re.fullmatch(r"[^\s:]+:[^\r\n]*", self.drive_remote):
+            raise ValueError("drive_remote must look like remote:folder")
         root = self.data_dir.resolve()
         protected = {Path(root.anchor), Path.home().resolve(), Path.cwd().resolve()}
         for key in ("WINDIR", "PROGRAMFILES", "USERPROFILE"):

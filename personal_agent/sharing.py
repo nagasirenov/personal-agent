@@ -88,7 +88,9 @@ class SharingStore:
         return not note.get("revoked_at") and (expires is None or expires > now)
 
     # -- notes -------------------------------------------------------------------------------------
-    def add_note(self, text: object, *, source: str, expires_hours: object = None, now: datetime | None = None) -> dict:
+    def add_note(self, text: object, *, source: str, expires_hours: object = None, now: datetime | None = None,
+                 chat_id: int | None = None) -> dict:
+        """chat_id limits a note to one group chat; without it the note is for the shared second account only."""
         now = now or _now()
         text = clean_text(text, MAX_NOTE_CHARS)
         if expires_hours is None:
@@ -104,13 +106,18 @@ class SharingStore:
         state["seq"] += 1
         note = {"id": state["seq"], "text": text, "created_at": now.isoformat(), "expires_at": expires_at,
                 "source": source}
+        if chat_id is not None:
+            note["chat_id"] = chat_id
         state["notes"].append(note)
         self._save(state)
         return dict(note)
 
-    def active_notes(self, now: datetime | None = None) -> list[dict]:
+    def active_notes(self, now: datetime | None = None, *, audience: object = "all") -> list[dict]:
+        """audience: 'all' (owner's overview), 'secondary' (notes without a chat) or a group's chat_id."""
         now = now or _now()
-        return [dict(n) for n in self._load()["notes"] if self._is_active(n, now)]
+        return [dict(n) for n in self._load()["notes"]
+                if self._is_active(n, now) and (audience == "all" or n.get("chat_id") == (
+                    None if audience == "secondary" else audience))]
 
     def revoke_note(self, note_id: object, now: datetime | None = None) -> bool:
         now = now or _now()
@@ -124,7 +131,9 @@ class SharingStore:
         return False
 
     # -- requests ----------------------------------------------------------------------------------
-    def create_request(self, text: object, now: datetime | None = None) -> dict:
+    def create_request(self, text: object, now: datetime | None = None, *, chat_id: int | None = None,
+                       chat_title: str = "", requester: str = "") -> dict:
+        """A permission request from the second account, or from a group chat (chat_id, chat_title, requester)."""
         now = now or _now()
         text = clean_text(text, MAX_REQUEST_CHARS)
         state = self._load()
@@ -132,6 +141,9 @@ class SharingStore:
         state["seq"] += 1
         request = {"id": state["seq"], "from": "secondary", "request_text": text, "created_at": now.isoformat(),
                    "status": "pending"}
+        if chat_id is not None:
+            request.update({"from": "group", "chat_id": chat_id, "chat_title": chat_title[:100],
+                            "requester": requester[:64]})
         state["requests"].append(request)
         self._save(state)
         return dict(request)
@@ -148,12 +160,14 @@ class SharingStore:
         self._save(state)
         return [dict(r) for r in state["requests"] if r.get("status") == "pending"]
 
-    def recent_requests(self, now: datetime | None = None, limit: int = 5) -> list[dict]:
+    def recent_requests(self, now: datetime | None = None, limit: int = 5, *, audience: object = "all") -> list[dict]:
+        """audience: 'all', 'secondary' (requests without a chat) or one group's chat_id."""
         now = now or _now()
         state = self._load()
         self._refresh(state, now)
         self._save(state)
-        return [dict(r) for r in state["requests"]][-limit:]
+        return [dict(r) for r in state["requests"]
+                if audience == "all" or r.get("chat_id") == (None if audience == "secondary" else audience)][-limit:]
 
     def get_request(self, request_id: object, now: datetime | None = None) -> dict | None:
         now = now or _now()

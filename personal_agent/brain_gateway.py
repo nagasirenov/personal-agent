@@ -37,7 +37,26 @@ _REPLAY_FIELDS = {
     "reasoning": ("type", "summary", "encrypted_content"),
     "function_call": ("type", "call_id", "name", "arguments"),
     "message": ("type", "role", "content", "phase"),
+    # Unlike the items above this one needs its server id and the full result: without both the model
+    # regenerates the picture (id) or the endpoint answers HTTP 400 (result).
+    "image_generation_call": ("type", "id", "status", "result", "revised_prompt"),
 }
+_BUILTIN_TOOL_TYPES = frozenset({"image_generation"})
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+_JPEG_MAGIC = b"\xff\xd8\xff"
+
+
+@dataclass(frozen=True)
+class GeneratedImage:
+    """One picture made by the built-in image generator, already decoded and validated."""
+
+    data: bytes
+    revised_prompt: str = ""
+    item_id: str = ""
+
+    @property
+    def suffix(self) -> str:
+        return ".png" if self.data.startswith(_PNG_MAGIC) else ".jpg"
 
 
 def _tool_error(code: str) -> str:
@@ -78,7 +97,28 @@ def _replayable(item: dict) -> dict | None:
     fields = _REPLAY_FIELDS.get(item.get("type"))
     if fields is None:
         return None
+    if item.get("type") == "image_generation_call" and (
+            not isinstance(item.get("result"), str) or not item.get("result")
+            or not isinstance(item.get("id"), str)):
+        return None
     return {key: item[key] for key in fields if key in item}
+
+
+def _generation_items(events: list[dict]) -> list[dict]:
+    """Every image_generation_call of one response: from the done events and from the completed output."""
+    found: list[dict] = []
+    for event in events:
+        kind = event.get("type")
+        if kind == "response.output_item.done" and isinstance(event.get("item"), dict):
+            candidates = [event["item"]]
+        elif kind == "response.completed":
+            output = (event.get("response") or {}).get("output")
+            candidates = output if isinstance(output, list) else []
+        else:
+            continue
+        found.extend(item for item in candidates
+                     if isinstance(item, dict) and item.get("type") == "image_generation_call")
+    return found
 
 
 _SSE_HEAD = (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
@@ -97,7 +137,9 @@ class BrainRequestGateway:
     MAX_TOOL_CALLS = 24
     MAX_TOOL_IMAGES = 8
     MAX_TOOL_OUTPUT = 256 * 1024
-    MAX_BUFFERED_RESPONSE = 16 * 1024 * 1024
+    MAX_BUFFERED_RESPONSE = 32 * 1024 * 1024
+    MAX_GENERATED_IMAGE = 15 * 1024 * 1024
+    MAX_GENERATED_IMAGES = 4
     TOOL_TIMEOUT = 300.0
 
     def __init__(
@@ -107,6 +149,7 @@ class BrainRequestGateway:
         require_auth: bool = True,
         tools: Sequence[dict] = (),
         tool_handler: ToolHandler | None = None,
+        builtin_tools: Sequence[dict] = (),
     ) -> None:
         try:
             url = urlsplit(upstream_url)
@@ -142,10 +185,19 @@ class BrainRequestGateway:
                 or len(set(names)) != len(names)
                 or (self._tools and not callable(tool_handler))):
             raise ValueError("gateway_invalid_tools")
+        try:
+            self._builtin_tools = tuple(json.loads(json.dumps(list(builtin_tools))))
+        except (TypeError, ValueError):
+            raise ValueError("gateway_invalid_builtin_tools") from None
+        if any(not isinstance(t, dict) or t.get("type") not in _BUILTIN_TOOL_TYPES
+               for t in self._builtin_tools) or len({t["type"] for t in self._builtin_tools}) != len(self._builtin_tools):
+            raise ValueError("gateway_invalid_builtin_tools")
         self._tool_names = frozenset(names)
         self._tool_handler = tool_handler
         self._tool_image_count = self._tool_image_bytes = 0
         self.tool_call_count = 0
+        self.generated_images: list[GeneratedImage] = []
+        self._generated_ids: set[str] = set()
         self.upstream_requests = 0
         self.vision_requests = 0  # upstream requests whose input carried at least one image
         self._upstream_url, self._require_auth = upstream_url, require_auth
@@ -208,8 +260,9 @@ class BrainRequestGateway:
         payload = {"instructions": self._instructions, "model": self._model,
                    "input": [{"role": "user", "content": content}],
                    "reasoning": {"effort": self._reasoning},
-                   "stream": True, "store": False, "tools": list(self._tools)}
-        if self._tools:
+                   "stream": True, "store": False,
+                   "tools": [*self._tools, *self._builtin_tools]}
+        if self._tools or self._builtin_tools:
             payload.update({"tool_choice": "auto", "parallel_tool_calls": True,
                             "include": ["reasoning.encrypted_content"]})
         return payload
@@ -322,7 +375,7 @@ class BrainRequestGateway:
 
     async def _forward(self, writer: asyncio.StreamWriter, headers: dict[str, str]) -> None:
         assert self._client is not None
-        if self._tools:
+        if self._tools or self._builtin_tools:
             await self._forward_with_tools(writer, headers)
             return
         headers = self._upstream_headers(headers)
@@ -390,6 +443,29 @@ class BrainRequestGateway:
             raise _Rejected(502, "gateway_upstream_not_sse")
         return bytes(raw)
 
+    def _collect_images(self, events: list[dict]) -> None:
+        """Keep each valid generated picture once (by item id), however many rounds repeat it."""
+        for item in _generation_items(events):
+            result, item_id = item.get("result"), item.get("id")
+            if (not isinstance(result, str) or not result
+                    or len(result) > self.MAX_GENERATED_IMAGE * 4 // 3 + 16):
+                continue
+            key = item_id if isinstance(item_id, str) and item_id else "sha:" + str(hash(result))
+            if key in self._generated_ids or len(self.generated_images) >= self.MAX_GENERATED_IMAGES:
+                continue
+            try:
+                data = base64.b64decode(result, validate=True)
+            except ValueError:
+                continue
+            if (not 0 < len(data) <= self.MAX_GENERATED_IMAGE
+                    or not (data.startswith(_PNG_MAGIC) or data.startswith(_JPEG_MAGIC))):
+                continue
+            self._generated_ids.add(key)
+            prompt = item.get("revised_prompt")
+            self.generated_images.append(GeneratedImage(
+                data, prompt[:2000] if isinstance(prompt, str) else "",
+                item_id if isinstance(item_id, str) else ""))
+
     async def _run_tool(self, name: str, raw_arguments: object, call_id: str) -> ToolOutcome:
         """Never raises (except cancellation); every failure becomes a JSON error for the model."""
         if name not in self._tool_names:
@@ -449,7 +525,9 @@ class BrainRequestGateway:
                 if exhausted:
                     body["tool_choice"] = "none"
                 raw = await self._post_buffered(headers, body)
-                items = _output_items(_parse_sse(raw))
+                events = _parse_sse(raw)
+                self._collect_images(events)
+                items = _output_items(events)
                 calls = [item for item in items if item.get("type") == "function_call"]
                 if not calls:
                     writer.write(_SSE_HEAD + raw)

@@ -50,6 +50,7 @@ class ScriptedTurn:
     calls: Sequence[ScriptedCall] = ()
     reply: Any = "brain response"  # str or callable(records, prompt) -> str
     block: asyncio.Event | None = None  # wait on this before replying (cancellation tests)
+    generated: Sequence[Any] = ()  # GeneratedImage objects the "model" draws this turn (needs builtin_tools)
 
 
 def traced_handler(tool_handler, sink: list):
@@ -73,10 +74,13 @@ class ScriptedBrain:
     """Model double with the same `generate(prompt, request_id, *, images, tools, tool_handler)` contract."""
 
     def __init__(self, turns: Sequence[ScriptedTurn | str] = (), *, response: str = "brain response",
-                 image_input_supported: bool = False, error: Exception | None = None) -> None:
+                 image_input_supported: bool = False, error: Exception | None = None,
+                 image_generation_supported: bool = False) -> None:
         self.turns = [turn if isinstance(turn, ScriptedTurn) else ScriptedTurn(reply=turn) for turn in turns]
         self.response = response
         self.image_input_supported = image_input_supported
+        self.image_generation_supported = image_generation_supported
+        self._generated: dict[str | None, list] = {}
         self.error = error
         self.generate_calls: list[dict] = []
         self.records: list[ToolCallRecord] = []
@@ -89,8 +93,10 @@ class ScriptedBrain:
         return [record.name for record in self.records]
 
     async def generate(self, prompt: str, request_id: str | None = None, *, images: Sequence[Path] | None = None,
-                       tools: Sequence[dict] | None = None, tool_handler=None) -> str:
+                       tools: Sequence[dict] | None = None, tool_handler=None,
+                       builtin_tools: Sequence[dict] | None = None) -> str:
         call = {"prompt": prompt, "request_id": request_id, "images": list(images) if images else [],
+                "builtin_tools": list(builtin_tools or []),
                 "tools": list(tools or []), "tool_names": [tool["name"] for tool in (tools or [])]}
         self.generate_calls.append(call)
         self.started.set()
@@ -111,7 +117,12 @@ class ScriptedBrain:
             self.records.append(record)
         if turn.block is not None:
             await turn.block.wait()
+        if turn.generated and builtin_tools:
+            self._generated.setdefault(request_id, []).extend(turn.generated)
         return turn.reply(records, prompt) if callable(turn.reply) else turn.reply
+
+    def consume_generated_images(self, request_id: str | None) -> list:
+        return self._generated.pop(request_id, [])
 
     async def cancel(self, request_id: str | None = None) -> None:
         self.cancel_calls.append(request_id)
@@ -122,7 +133,8 @@ class ScriptedBrain:
 
     def model_info(self) -> dict:
         return {"backend": "fixture", "model": "fixture-model",
-                "image_input_supported": self.image_input_supported}
+                "image_input_supported": self.image_input_supported,
+                "image_generation_supported": self.image_generation_supported}
 
     async def close(self) -> None:
         return None

@@ -79,7 +79,7 @@ class MemoryStoreTests(unittest.TestCase):
             self.assertIn("sender_id", columns)
             self.assertIn("idx_attachments_sender_time", indexes)
             self.assertEqual(sender_id, 42)
-            self.assertEqual(version, 1)
+            self.assertEqual(version, 2)
 
     def test_recent_attachments_is_sender_scoped_and_new_rows_store_sender_id(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

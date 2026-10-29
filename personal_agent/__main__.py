@@ -97,7 +97,7 @@ async def discover_ids() -> list[dict]:
         identities = {}
         for update in updates:
             message = parse_message(update)
-            if message:
+            if message and message.chat_type == "private":
                 identities[message.sender_id] = {"telegram_user_id": message.sender_id, "chat": "private"}
         return list(identities.values())
     finally:

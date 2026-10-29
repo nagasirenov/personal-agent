@@ -3,14 +3,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
 from .backends import BackendError
 from .context import ContextBuilder
+from .generated_images import save_generated
+from .groups import admitted_group, group_title
 from .media import LocalTranscriber
 from .models import Identity, IncomingMessage, TimelineEvent
+from .reply_context import memory_prefix
 from .security import ActionGate
 from .self_knowledge import ServiceKnowledge, account_role, remember_preferences
 from .observation_requests import parse_slash_command
@@ -81,6 +85,7 @@ class TaskSupervisor:
                                             transcriber=self.transcriber)
         self.tool_registry = DEFAULT_REGISTRY
         self.typing_interval = TYPING_INTERVAL
+        self._generated: dict[str, list] = {}  # request id -> pictures drawn by the model, until delivered
         self.accepting = True
         self.active: dict[int, tuple[str, asyncio.Task]] = {}
         self.tasks: set[asyncio.Task] = set()
@@ -98,25 +103,57 @@ class TaskSupervisor:
     def _save_active(self) -> None:
         self.store.set_state("active_turns", {str(uid): rid for uid, (rid, task) in self.active.items() if not task.done()})
 
+    def _scope_group_message(self, message: IncomingMessage) -> IncomingMessage | None:
+        """A group message re-scoped to its chat (sender_id=chat id, actor_id=author); None unless the chat is
+        one the bot currently serves (the owner is a member).  Group storage is keyed by the chat from here on."""
+        if (not message.is_group or type(message.chat_id) is not int or message.chat_id >= 0
+                or type(message.sender_id) is not int or message.sender_id <= 0
+                or admitted_group(self.store, message.chat_id) is None):
+            return None
+        return replace(message, sender_id=message.chat_id, actor_id=message.sender_id)
+
+    @staticmethod
+    def _turn_key(message: IncomingMessage):
+        """Who a running turn belongs to: the account, or one member of a group (members do not cancel each other)."""
+        return f"{message.chat_id}:{message.actor_id}" if message.is_group else message.sender_id
+
     async def submit(self, message: IncomingMessage, identity: Identity) -> None:
         if not self.accepting or self.stop.is_set():
             return
-        # Recheck at the boundary; callers cannot forge the role they supply.
-        expected = self.config.primary_id if identity == Identity.PRIMARY else self.config.secondary_id
-        if message.sender_id != expected:
-            return
-        prior = self.active.get(message.sender_id)
+        group = identity == Identity.GROUP
+        if group:
+            scoped = self._scope_group_message(message)
+            if scoped is None:
+                return
+            message = scoped
+            # Every message of an admitted group goes to that group's feed; only addressed ones start a turn.
+            saved_message_id = self.store.record_message(
+                message.sender_id, "user", memory_prefix(message) + (message.text or "[attachment]"), chat_id=message.chat_id,
+                sender_id=message.actor_id, sender_name=message.sender_name)
+            if not message.addressed:
+                return
+        else:
+            # Recheck at the boundary; callers cannot forge the role they supply.
+            if message.is_group:
+                return
+            expected = self.config.primary_id if identity == Identity.PRIMARY else self.config.secondary_id
+            if message.sender_id != expected:
+                return
+        key = self._turn_key(message)
+        prior = self.active.get(key)
         if prior and not prior[1].done():
             # A new message always supersedes the running turn of the same sender; the rebuilt turn sees
             # the earlier unanswered messages in its context (unanswered_user_messages).
             prior[1].cancel()
             self.store.record_event(TimelineEvent("telegram", "STEERING", {
-                "sender_id": message.sender_id, "previous_request_id": prior[0],
+                "sender_id": message.actor_id or message.sender_id, "previous_request_id": prior[0],
                 "message_id": message.message_id, "policy": "cancel_previous_and_rebuild_context",
             }))
         # Start a fresh receipt; current-turn preferences are selected by the model tool.
         remember_preferences(self.store, message.sender_id, "")
-        saved_message_id = self.store.record_message(message.sender_id, "user", message.text or "[attachment]")
+        if not group:
+            saved_message_id = self.store.record_message(
+                message.sender_id, "user", memory_prefix(message) + (message.text or "[attachment]"))
         pending = sum(not task.done() and not task.cancelling() for task in self.tasks)
         if pending >= self.config.max_pending_tasks:
             # Keep polling responsive even when an upstream transport is slow to cancel.
@@ -126,19 +163,42 @@ class TaskSupervisor:
         task = asyncio.create_task(self._respond(message, identity, rid, user_message_id=saved_message_id),
                                    name=f"turn-{rid}")
         self.tasks.add(task)
-        self.active[message.sender_id] = rid, task
+        self.active[key] = rid, task
         task.add_done_callback(self.tasks.discard)
         self._save_active()
 
-    async def _attachment(self, message: IncomingMessage):
+    def _pipeline(self):
         from .attachments import AttachmentPipeline
-        pipeline = AttachmentPipeline(self.config, self.store, self.telegram, self.transcriber,
-                                      self.video_analyzer)
-        return await pipeline.prepare(message)
+        return AttachmentPipeline(self.config, self.store, self.telegram, self.transcriber, self.video_analyzer)
+
+    async def _attachment(self, message: IncomingMessage):
+        return await self._pipeline().prepare(message)
+
+    async def _reply_context(self, message: IncomingMessage) -> tuple[dict | None, list, list[dict]]:
+        """(reply_context for the prompt, extra images, extra observations): what the message answers, the forwarded
+        original's author, and the picture of the replied-to message when it has one.  Never raises."""
+        if not message.reply_to and not message.forwarded_from:
+            return None, [], []
+        reply = dict(message.reply_to) if message.reply_to else None
+        images: list = []
+        observations: list[dict] = []
+        if reply:
+            extra, images, observations = await self._pipeline().reply_media(
+                message, has_own_attachment=bool(message.attachment), download=self._supports_images())
+            reply.update(extra)
+            if images and not self._supports_images():
+                images, observations = [], []
+        return {"reply_to": reply, "forwarded_from": message.forwarded_from}, images, observations
 
     def _supports_images(self) -> bool:
         info = self.brain.model_info() if hasattr(self.brain, "model_info") else {}
         return bool(info.get("image_input_supported", False))
+
+    def _supports_image_generation(self) -> bool:
+        if not getattr(self.config, "image_generation", True):
+            return False
+        info = self.brain.model_info() if hasattr(self.brain, "model_info") else {}
+        return bool(info.get("image_generation_supported", False))
 
     @property
     def action_gate(self):
@@ -156,11 +216,14 @@ class TaskSupervisor:
             sender_id=message.sender_id, chat_id=message.chat_id, request_id=request_id,
             browser_context_provider=self.browser_context_provider,
             browser_capture_provider=self.browser_capture_provider, supports_images=self._supports_images,
-            current_observations=observations, video_analyzer=self.video_analyzer)
+            current_observations=observations, video_analyzer=self.video_analyzer,
+            actor_id=message.actor_id, actor_name=message.sender_name,
+            chat_title=(group_title(self.store, message.chat_id) or message.chat_title) if message.is_group else "")
 
     async def _generate(self, text: str, user_id: int, request_id: str, *, observation=None, images=None,
                         turn: TurnTools | None = None, recent_media=None, recent_documents=None,
-                        current_message_id: str | None = None) -> str:
+                        current_message_id: str | None = None, speaker: dict | None = None,
+                        reply_context: dict | None = None) -> str:
         try:
             owner = account_role(self.config, user_id) == "owner"
             browser_context = self.browser_context_provider() if self.browser_context_provider and owner else None
@@ -168,7 +231,8 @@ class TaskSupervisor:
             browser_context = None
         prompt = self.context.build(text, user_id, observation=observation, image_count=len(images or []),
                                     browser_context=browser_context, recent_media=recent_media,
-                                    recent_documents=recent_documents, current_message_id=current_message_id)
+                                    recent_documents=recent_documents, current_message_id=current_message_id,
+                                    speaker=speaker, reply_context=reply_context)
         cloud = self.config.backend != "mock"
         kwargs = {"request_id": request_id}
         tool_log: list[dict] = []
@@ -177,6 +241,8 @@ class TaskSupervisor:
             kwargs.update(tools=definitions, tool_handler=_recording_handler(handler, tool_log))
         if images:
             kwargs["images"] = images
+        if self._supports_image_generation():
+            kwargs["builtin_tools"] = [{"type": "image_generation"}]
         sent_chars, attempts = len(prompt), 0
         try:
             attempts += 1
@@ -199,6 +265,13 @@ class TaskSupervisor:
         finally:
             self._record_usage(request_id, cloud=cloud, sent_chars=sent_chars, attempts=attempts,
                                had_images=bool(images), tool_calls=len(tool_log))
+            try:
+                if hasattr(self.brain, "consume_generated_images"):
+                    drawn = self.brain.consume_generated_images(request_id)
+                    if drawn:
+                        self._generated[request_id] = list(drawn)
+            except Exception:
+                pass
         if cloud:
             self.store.increment_metric("cloud_output_estimate", (len(response) + 3) // 4)
         return response
@@ -217,11 +290,14 @@ class TaskSupervisor:
                     self.store.increment_metric("vision_calls_today", vision)
                 if usage.get("tool_calls", tool_calls):
                     self.store.increment_metric("tool_calls_today", usage.get("tool_calls", tool_calls))
+                if usage.get("images"):
+                    self.store.increment_metric("images_generated_today", usage["images"])
         except Exception:
             pass
 
     async def _model_answer(self, text: str, message: IncomingMessage, request_id: str, observations: list[dict], *,
-                            attachment_images=None, turn: TurnTools, user_message_id: str | None = None) -> str:
+                            attachment_images=None, turn: TurnTools, user_message_id: str | None = None,
+                            reply_context: dict | None = None) -> str:
         """One model call; the model chooses and chains tools itself through the native tool loop."""
         candidates = list(attachment_images or []) + [
             Path(item["path"]) for item in observations
@@ -233,7 +309,9 @@ class TaskSupervisor:
             text, message.sender_id, request_id,
             observation={"results": observations} if observations else None, images=images, turn=turn,
             recent_media=turn.public_media_catalog(exclude_ids=current_ids),
-            recent_documents=turn.document_catalog(), current_message_id=user_message_id)
+            recent_documents=turn.document_catalog(), current_message_id=user_message_id,
+            speaker={"name": message.sender_name, "id": message.actor_id} if message.is_group else None,
+            reply_context=reply_context)
 
     def _record_error(self, exc: Exception, request_id: str) -> str:
         import re
@@ -246,6 +324,39 @@ class TaskSupervisor:
         self.store.set_state("last_turn_error", {"request_id": request_id, "type": type(exc).__name__, "code": code,
                                                  "detail": detail, "at": datetime.now(timezone.utc).isoformat()})
         return code
+
+    async def _send_generated(self, message: IncomingMessage, request_id: str) -> tuple[int, int]:
+        """Send the turn's generated pictures to the current chat; returns (sent, failed). Never raises."""
+        pictures = self._generated.pop(request_id, [])
+        if not pictures:
+            return 0, 0
+        try:
+            saved = save_generated(self.config.data_dir, message.sender_id, request_id, pictures)
+        except Exception:
+            saved = []
+        sent, failed = 0, len(pictures) - len(saved)
+        for picture in saved:
+            error, method = None, ""
+            try:
+                if message.is_group and message.message_id:
+                    method = await self.telegram.send_photo(message.chat_id, picture.path, "",
+                                                            reply_to=message.message_id)
+                else:
+                    method = await self.telegram.send_photo(message.chat_id, picture.path, "")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                error = type(exc).__name__
+            sent, failed = sent + (error is None), failed + (error is not None)
+            try:
+                self.store.record_event(TimelineEvent("telegram", "IMAGE_GENERATED", {
+                    "sender_id": message.sender_id, "chat_id": message.chat_id, "request_id": request_id,
+                    "media_id": picture.media_id, "name": picture.path.name, "size": picture.size,
+                    "ok": error is None, "method": method if isinstance(method, str) else "",
+                    "error": error, "revised_prompt": picture.revised_prompt[:300]}))
+            except Exception:
+                pass
+        return sent, failed
 
     async def _keep_typing(self, chat_id: int) -> None:
         """Refresh the chat's typing indicator while a turn runs; delivery problems never affect the turn."""
@@ -261,7 +372,7 @@ class TaskSupervisor:
     async def _respond(self, message: IncomingMessage, identity: Identity, request_id: str, *,
                        user_message_id: str | None = None) -> None:
         typing: asyncio.Task | None = None
-        owner = account_role(self.config, message.sender_id) == "owner"
+        owner = account_role(self.config, message.sender_id, message.chat_id) == "owner"
         refuse = not owner and _owner_only_command(message.text)
         try:
             if not refuse and (message.text or "").strip().casefold() not in _EXACT_COMMANDS:
@@ -297,6 +408,10 @@ class TaskSupervisor:
                         text = "Посмотри присланное видео (кадры, речь, метаданные) и ответь по его содержимому."
                     else:
                         text = "Рассмотри присланное изображение и ответь по его содержимому."
+                reply_context, reply_images, reply_observations = await self._reply_context(message)
+                if reply_observations:
+                    observations = [*reply_observations, *observations]  # the current message's own pictures come last
+                    attachment_images = [*reply_images, *attachment_images]
                 turn = self._turn_tools(message, request_id, observations)
                 results = []
                 # Only the exact commands /ls, /read and /screenshot run before the model; every
@@ -309,15 +424,29 @@ class TaskSupervisor:
                     text += "\n\nATTACHMENT STATUS (untrusted):\n" + attachment_note
                 response = await self._model_answer(text, message, request_id, results,
                                                     attachment_images=attachment_images, turn=turn,
-                                                    user_message_id=user_message_id)
+                                                    user_message_id=user_message_id, reply_context=reply_context)
             if self.stop.is_set() or not self.accepting:
                 return
-            response = format_response(response, preferences_for(self.store, message.sender_id))[:16000] or "Модель вернула пустой ответ."
+            response = format_response(response, preferences_for(self.store, message.sender_id))[:16000]
+            sent_pictures, failed_pictures = await self._send_generated(message, request_id)
+            if failed_pictures:
+                note = ("Картинку не удалось отправить в Telegram." if failed_pictures == 1
+                        else f"Не удалось отправить в Telegram картинок: {failed_pictures}.")
+                response = f"{response}\n\n{note}" if response else note
+            if not response and not sent_pictures:
+                response = "Модель вернула пустой ответ."
             pending_replies = self.store.get_state("pending_replies", {})
             pending_replies[request_id] = {"chat_id": message.chat_id, "text": response, "status": "delivery_pending"}
             self.store.set_state("pending_replies", pending_replies)
-            await self.telegram.send_text(message.chat_id, response)
-            self.store.record_message(message.sender_id, "assistant", response)
+            history = response or "[отправлена сгенерированная картинка]"
+            if message.is_group:
+                if response:
+                    await self.telegram.send_text(message.chat_id, response, reply_to=message.message_id or None)
+                self.store.record_message(message.sender_id, "assistant", history, chat_id=message.chat_id)
+            else:
+                if response:
+                    await self.telegram.send_text(message.chat_id, response)
+                self.store.record_message(message.sender_id, "assistant", history)
             pending_replies = self.store.get_state("pending_replies", {})
             pending_replies.pop(request_id, None)
             self.store.set_state("pending_replies", pending_replies)
@@ -339,12 +468,14 @@ class TaskSupervisor:
                 except Exception:
                     pass
         finally:
+            self._generated.pop(request_id, None)
             if typing is not None:
                 typing.cancel()
                 await asyncio.gather(typing, return_exceptions=True)
-            current = self.active.get(message.sender_id)
+            key = self._turn_key(message)
+            current = self.active.get(key)
             if current and current[0] == request_id:
-                self.active.pop(message.sender_id, None)
+                self.active.pop(key, None)
             self._save_active()
 
     async def shutdown(self) -> None:

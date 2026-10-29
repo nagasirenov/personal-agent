@@ -18,6 +18,7 @@ from typing import Any
 
 from .action_broker import ActionDenied, build_action_request
 from .brain_gateway import ToolHandler, ToolOutcome
+from .generated_images import list_generated
 from .file_delivery import IMAGE_SUFFIXES, MAX_FILES_PER_TURN, FileSender, default_ffmpeg, find_rclone
 from .context import _parse_utc, _select_browser_context
 from .memory import MAX_PROFILE_CHARACTERS
@@ -111,10 +112,14 @@ class TurnTools:
                  sender_id: int, chat_id: int, request_id: str, browser_context_provider=None,
                  browser_capture_provider=None,
                  supports_images: Callable[[], bool] = lambda: False,
-                 current_observations: list[dict] | None = None, video_analyzer=None) -> None:
+                 current_observations: list[dict] | None = None, video_analyzer=None,
+                 actor_id: int | None = None, actor_name: str = "", chat_title: str = "") -> None:
+        """sender_id is the storage scope of the turn: the account's id in a private chat, the chat's own id in a
+        group.  There actor_id/actor_name are the member who asked and chat_title names the group."""
         self.config, self.store, self.context, self.knowledge = config, store, context, knowledge
         self.action_broker, self.profile_store, self.telegram = action_broker, profile_store, telegram
         self.sender_id, self.chat_id, self.request_id = sender_id, chat_id, request_id
+        self.actor_id, self.actor_name, self.chat_title = actor_id, actor_name, chat_title
         self.browser_context_provider = browser_context_provider
         self.browser_capture_provider = browser_capture_provider
         self.supports_images = supports_images
@@ -134,7 +139,7 @@ class TurnTools:
     @property
     def is_owner(self) -> bool:
         """Only the configured primary account may touch the owner's PC; every other sender is restricted."""
-        return account_role(self.config, self.sender_id) == "owner"
+        return account_role(self.config, self.sender_id, self.chat_id) == "owner"
 
     def _require_owner(self) -> None:
         if not self.is_owner:
@@ -421,6 +426,13 @@ class TurnTools:
             entries.append({"media_id": attachment_id, "kind": str(metadata.get("kind", "image")),
                             "time": metadata.get("time"), "paths": paths, "frames": None})
             seen.add(attachment_id)
+        for picture in list_generated(self.config.data_dir, uid, limit=_MEDIA_CATALOG_SIZE):
+            if picture["media_id"] in seen:
+                continue
+            entries.append({"media_id": picture["media_id"], "kind": "generated_image", "time": picture["time"],
+                            "paths": [picture["path"]], "frames": None,
+                            "extra": {"prompt": picture["prompt"]} if picture["prompt"] else {}})
+            seen.add(picture["media_id"])
         try:
             videos = self.video_analyzer.list_entries(uid, limit=_MEDIA_CATALOG_SIZE)
         except VideoError:
@@ -626,6 +638,7 @@ class TurnTools:
         notify = _bool_arg(args, "notify", True)
         request_id = self._request_id_arg(args, required=False)
         kind = "share_with_secondary"
+        group_chat = None  # a request that came from a group is answered to that group only
         try:
             if request_id is not None:
                 request = self.sharing.get_request(request_id)
@@ -633,8 +646,9 @@ class TurnTools:
                     return _error(kind, "request_not_found")
                 if request["status"] != "pending":
                     return _error(kind, "request_not_pending")
+                group_chat = request.get("chat_id")
             note = self.sharing.add_note(args["text"], source=f"request:{request_id}" if request_id else "owner_turn",
-                                         expires_hours=args.get("expires_hours"))
+                                         expires_hours=args.get("expires_hours"), chat_id=group_chat)
             if request_id is not None:
                 self.sharing.resolve_request(request_id, "approved")
         except SharingError as exc:
@@ -644,8 +658,11 @@ class TurnTools:
         result = {"kind": kind, "ok": True, "note_id": note["id"], "text_shared": note["text"],
                   "expires_at": note["expires_at"], "request_id": request_id,
                   "request_status": "approved" if request_id is not None else None, "notified_secondary": False}
+        if group_chat is not None:
+            result["audience"] = {"group": request.get("chat_title") or "группа"}
         if notify:
-            delivery = await self._tell(self.config.secondary_id, "Владелец разрешил передать: " + note["text"])
+            delivery = await self._tell(self.config.secondary_id if group_chat is None else group_chat,
+                                        "Владелец разрешил передать: " + note["text"])
             result["notified_secondary"] = delivery["delivered"]
             if not delivery["delivered"]:
                 result["delivery_error"] = delivery["delivery_error"]
@@ -660,14 +677,16 @@ class TurnTools:
         notify = _bool_arg(args, "notify", True)
         reason = _text_arg(args, "reason", maximum=300, allow_empty=True).strip() if "reason" in args else ""
         try:
-            self.sharing.resolve_request(request_id, "denied", owner_note=reason)
+            request = self.sharing.resolve_request(request_id, "denied", owner_note=reason)
         except SharingError as exc:
             return _error("deny_secondary_request", exc.code)
         result = {"kind": "deny_secondary_request", "ok": True, "request_id": request_id,
                   "request_status": "denied", "notified_secondary": False}
         if notify:
             # Neutral on purpose: nothing about the owner, not even the reason, reaches the second account.
-            delivery = await self._tell(self.config.secondary_id, "Владелец не разрешил передать это.")
+            target = request.get("chat_id")
+            delivery = await self._tell(self.config.secondary_id if target is None else target,
+                                        "Владелец не разрешил передать это.")
             result["notified_secondary"] = delivery["delivered"]
             if not delivery["delivered"]:
                 result["delivery_error"] = delivery["delivery_error"]
@@ -680,7 +699,9 @@ class TurnTools:
                 "notes": [{key: note.get(key) for key in ("id", "text", "created_at", "expires_at", "source")}
                           for note in self.sharing.active_notes()],
                 "pending_requests": [{"request_id": r["id"], "request_text": r["request_text"],
-                                      "created_at": r["created_at"]} for r in self.sharing.pending_requests()]}
+                                      "created_at": r["created_at"],
+                                      **({"from_group": r.get("chat_title") or "группа"} if r.get("chat_id") is not None else {})}
+                                     for r in self.sharing.pending_requests()]}
 
     async def revoke_shared_note(self, args: dict) -> dict:
         self._require_owner()
@@ -697,16 +718,23 @@ class TurnTools:
             raise ToolArgumentError("unknown_tool")
         _check_args(args, required={"request"})
         kind = "ask_owner_permission"
+        in_group = account_role(self.config, self.sender_id, self.chat_id) == "group"
         try:
-            request = self.sharing.create_request(args["request"])
+            request = self.sharing.create_request(
+                args["request"], **({"chat_id": self.chat_id, "chat_title": self.chat_title,
+                                     "requester": self.actor_name} if in_group else {}))
         except SharingError as exc:
             if exc.code == "invalid_arguments":
                 raise ToolArgumentError("invalid_arguments") from None
             return _error(kind, exc.code)
+        # Always to the owner's PRIVATE chat, never to the group the request came from.
+        who = (f"В группе «{self.chat_title or 'без названия'}» {self.actor_name or 'участник'} просит: "
+               if in_group else "Второй аккаунт просит: ")
         delivery = await self._tell(
             self.config.primary_id,
-            f"Второй аккаунт просит: «{request['request_text']}» (запрос #{request['id']}). "
-            "Ответь, разрешаешь ли и что именно передать.")
+            f"{who}«{request['request_text']}» (запрос #{request['id']}). "
+            + ("Ответь, разрешаешь ли и что именно передать группе." if in_group
+               else "Ответь, разрешаешь ли и что именно передать."))
         if not delivery["delivered"]:
             self.sharing.drop_request(request["id"])
             return _error(kind, "owner_unreachable")

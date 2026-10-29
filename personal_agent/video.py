@@ -464,7 +464,7 @@ class VideoAnalyzer:
 
     # paths ------------------------------------------------------------------------------------
     def sender_root(self, sender_id: int) -> Path:
-        if type(sender_id) is not int or sender_id <= 0:
+        if type(sender_id) is not int or sender_id == 0:
             raise VideoError("invalid_sender")
         return owned_path(self.root, "memory", "videos", str(sender_id))
 

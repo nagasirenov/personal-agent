@@ -1,7 +1,7 @@
 """Incoming attachment preparation for local storage, transcription, and vision."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 import struct
@@ -16,6 +16,7 @@ from .telegram import TelegramError
 from .video import VIDEO_SUFFIXES, VideoAnalyzer, VideoError
 
 _VIDEO_KINDS = {"video", "video_note", "animation"}
+REPLY_IMAGE_KINDS = ("photo", "sticker")
 
 
 @dataclass(frozen=True)
@@ -205,6 +206,65 @@ class AttachmentPipeline:
         return AttachmentResult(
             notice=f"Вложение сохранено локально: {original_name}; {size} байт; ID {attachment_id}.",
         )
+
+    # -- the picture of the message the user replied to -----------------------------------------
+    def _stored_reply_image(self, scope: int, telegram_message_id: int) -> tuple[dict, Path] | None:
+        """An already-saved, viewable picture of this same storage scope that came with that Telegram message."""
+        root = owned_path(self.config.data_dir, "memory", "attachments")
+        limit = min(int(self.config.max_attachment_bytes), self.MAX_IMAGE_BYTES)
+        for metadata in self.store.recent_attachments(scope, limit=50):
+            if (metadata.get("message_id") != telegram_message_id or metadata.get("sender_id") != scope
+                    or metadata.get("kind") not in REPLY_IMAGE_KINDS or not metadata.get("id")):
+                continue
+            sticker = metadata.get("sticker") or {}
+            info = metadata.get("image")
+            if sticker.get("is_animated") or sticker.get("is_video") or not isinstance(info, dict):
+                continue  # animated stickers are rendered again from Telegram; only plain pictures are reused
+            size = metadata.get("size")
+            image = _ImageInfo(str(info.get("format", "")), int(info.get("width") or 0), int(info.get("height") or 0),
+                               bool(info.get("animated")))
+            path = Path(str(metadata.get("path", ""))).resolve()
+            if (not isinstance(size, int) or size > limit or not self._safe_dimensions(image)
+                    or not path.is_relative_to(root) or not path.is_file()):
+                continue
+            return metadata, path
+        return None
+
+    async def reply_media(self, message: IncomingMessage, *, has_own_attachment: bool,
+                          download: bool = True) -> tuple[dict, list[Path], list[dict]]:
+        """(fields for reply_to, images, observations) for a photo/sticker the message replies to.
+
+        The saved attachment of the same scope is used when there is one; otherwise, and only if the message has no
+        attachment of its own, the picture is downloaded through the ordinary pipeline (same limits).  Never raises."""
+        reply = message.reply_to or {}
+        media = reply.get("media")
+        if not isinstance(media, dict) or media.get("kind") not in REPLY_IMAGE_KINDS:
+            return {}, [], []
+        message_id = reply.get("message_id")
+        message_id = message_id if type(message_id) is int else 0
+        try:
+            stored = self._stored_reply_image(message.sender_id, message_id) if message_id else None
+            if stored is not None:
+                metadata, path = stored
+                info = metadata["image"]
+                observation = {
+                    "kind": "attachment_image", "path": str(path), "ok": True, "has_image": True,
+                    "origin": "telegram_reply", "attachment_id": str(metadata["id"]),
+                    "sender_id": message.sender_id, "message_id": message_id, "source_kind": metadata["kind"],
+                    "image_format": info.get("format"), "width": info.get("width"), "height": info.get("height"),
+                    "time": metadata.get("time"),
+                }
+                return {"media_id": str(metadata["id"])}, [path], [observation]
+            if has_own_attachment or not download or not media.get("file_id"):
+                return {"media_unavailable": True}, [], []
+            result = await self.prepare(replace(message, attachment=dict(media), message_id=message_id))
+            observations = [dict(item, origin="telegram_reply") for item in result.observations
+                            if item.get("kind") == "attachment_image" and item.get("has_image")]
+            if not result.images or not observations:
+                return {"media_unavailable": True}, [], []
+            return {"media_id": str(observations[0].get("attachment_id", ""))}, list(result.images), observations
+        except Exception:
+            return {"media_unavailable": True}, [], []
 
     async def _prepare_animated_sticker(
         self,

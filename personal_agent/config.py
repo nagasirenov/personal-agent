@@ -37,6 +37,8 @@ class Config:
     # Files too big for Telegram go to Google Drive through rclone: "gdrive:PersonalAgent" (empty = split instead).
     drive_remote: str = ""
     rclone_executable: str = ""
+    # Let the model draw pictures with the built-in image generator when asked (all roles, including groups).
+    image_generation: bool = True
 
     @property
     def tz(self) -> tzinfo:

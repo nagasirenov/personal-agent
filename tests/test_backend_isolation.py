@@ -82,7 +82,7 @@ class BackendIsolationTests(unittest.TestCase):
         self.assertIn("не наследуешь AGENTS.md, инструкции Codex, координатора", persona)
         self.assertIn("субагентов у тебя нет", persona)
         self.assertIn("нативные функции", persona)
-        self.assertLess(len(persona), 3200)
+        self.assertLess(len(persona), 3600)
         for removed in ("OBSERVATION_TOOL_PROTOCOL", "ACTION_TOOL_PROTOCOL", "WEB_LOOKUP_TOOL_PROTOCOL"):
             self.assertNotIn(removed, persona)
         self.assertNotIn("read-only observation capabilities through the runtime", persona)

@@ -33,5 +33,8 @@ telegram_api_base = "https://api.telegram.org"
 drive_remote = ""            # for example "gdrive:PersonalAgent"
 rclone_executable = ""       # empty = rclone on PATH or the WinGet install
 
+# The model may draw pictures with the built-in image generator when asked (all accounts and groups).
+image_generation = true
+
 [project_roots]
 # nagaport = 'C:\Users\nagas\Desktop\port\ntm-port-1.12.2'

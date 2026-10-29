@@ -123,7 +123,7 @@ class BackendsTests(unittest.IsolatedAsyncioTestCase):
     def test_public_generate_signature(self):
         signature = inspect.signature(BrainBackend.generate)
         self.assertEqual(
-            list(signature.parameters), ["self", "prompt", "request_id", "images", "tools", "tool_handler"]
+            list(signature.parameters), ["self", "prompt", "request_id", "images", "tools", "tool_handler", "builtin_tools"]
         )
         self.assertIsNone(signature.parameters["request_id"].default)
         self.assertEqual(

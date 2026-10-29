@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 import re
 from typing import Any
 
+from .reply_context import strip_memory_prefix
+
 
 DEFAULT_PREFERENCES: dict[str, Any] = {
     "response_format": "auto",
@@ -179,7 +181,7 @@ class PreferenceStore:
         for message in reversed(self.store.recent_messages(int(user_id), limit=100)):
             if message.get("role") != "user":
                 continue
-            text = str(message.get("text", ""))
+            text = strip_memory_prefix(str(message.get("text", "")))
             update = {**parse_preference_update(text), **_legacy_style_update(text)}
             update.pop("user_memory_note", None)
             result.update(update)

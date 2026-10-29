@@ -29,7 +29,7 @@ _MEMORY_DIRS = (
 )
 _FTS_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _QUERY_STOPWORDS = set("а в во где для до за и из к как когда ли мне на насколько не о об от по почему с со то у чем что я ты мы вы он она это этом этой сегодня вчера последние последний последних час часа часов минут минуты делал делала занимался занималась готов готова готовность портом порта the a an is are what where when why how did i my last today yesterday".split())
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 MAX_PROFILE_CHARACTERS = 24_000
 
 
@@ -203,6 +203,17 @@ class MemoryStore:
                         "CREATE INDEX IF NOT EXISTS idx_attachments_sender_time "
                         "ON attachments(sender_id, time_utc)"
                     )
+                if target == 2:
+                    # Who wrote a message and in which chat; a group chat's id is also its storage scope (user_id).
+                    columns = {str(row["name"]) for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()}
+                    for column, kind in (("chat_id", "INTEGER"), ("sender_id", "INTEGER"), ("sender_name", "TEXT")):
+                        if column not in columns:
+                            self._conn.execute(f"ALTER TABLE messages ADD COLUMN {column} {kind}")
+                    # Existing messages are all from private chats: the chat is the account itself.
+                    self._conn.execute("UPDATE messages SET chat_id=user_id WHERE chat_id IS NULL")
+                    self._conn.execute("UPDATE messages SET sender_id=user_id WHERE sender_id IS NULL AND role='user'")
+                    self._conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_id, time_utc)")
                 self._conn.execute(f"PRAGMA user_version={target}")
             version = target
 
@@ -332,14 +343,20 @@ class MemoryStore:
                 results.append(base)
         return results
 
-    def record_message(self, user_id: int, role: str, text: str) -> str:
+    def record_message(self, user_id: int, role: str, text: str, *, chat_id: int | None = None,
+                       sender_id: int | None = None, sender_name: str | None = None) -> str:
+        """user_id is the storage scope (the account, or a group chat's id); chat_id/sender_id say where and
+        who: they default to the private-chat meaning (the account itself, for user messages)."""
         self._ensure_open()
         message_id = str(uuid4())
         when = _dt_text(datetime.now(timezone.utc))
+        chat = int(user_id) if chat_id is None else int(chat_id)
+        sender = (int(user_id) if role == "user" else None) if sender_id is None else int(sender_id)
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT INTO messages(id,user_id,role,text,time_utc) VALUES(?,?,?,?,?)",
-                (message_id, int(user_id), str(role), str(text), when),
+                "INSERT INTO messages(id,user_id,role,text,time_utc,chat_id,sender_id,sender_name) VALUES(?,?,?,?,?,?,?,?)",
+                (message_id, int(user_id), str(role), str(text), when, chat, sender,
+                 None if sender_name is None else str(sender_name)),
             )
             self._conn.execute(
                 "INSERT INTO memory_fts(kind,ref_id,project,time_utc,text) VALUES(?,?,?,?,?)",
@@ -357,6 +374,20 @@ class MemoryStore:
                 """SELECT id,user_id,role,text,time_utc FROM messages WHERE user_id=?
                    ORDER BY time_utc DESC, rowid DESC LIMIT ?""",
                 (int(user_id), bounded),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def recent_chat_messages(self, chat_id: int, limit: int = 100) -> list[dict[str, Any]]:
+        """The newest messages stored under one chat scope with their authors, oldest first."""
+        self._ensure_open()
+        bounded = _limit(limit, 1000)
+        if bounded == 0:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT id,user_id,role,text,time_utc,chat_id,sender_id,sender_name FROM messages
+                   WHERE user_id=? ORDER BY time_utc DESC, rowid DESC LIMIT ?""",
+                (int(chat_id), bounded),
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
@@ -446,7 +477,7 @@ class MemoryStore:
         append: bool = False,
     ) -> dict[str, Any]:
         """Persist a user-requested profile under the sender's account, separate from chat history."""
-        if type(user_id) is not int or user_id <= 0 or not isinstance(text, str):
+        if type(user_id) is not int or user_id == 0 or not isinstance(text, str):
             raise ValueError("A valid user and profile text are required")
         profile_text = text.removeprefix("\ufeff").strip()
         if not profile_text or "\x00" in profile_text:
@@ -487,7 +518,7 @@ class MemoryStore:
 
     def get_user_profile(self, user_id: int) -> dict[str, Any] | None:
         """Read back only the profile whose key is scoped to this exact Telegram sender."""
-        if type(user_id) is not int or user_id <= 0:
+        if type(user_id) is not int or user_id == 0:
             raise ValueError("A valid user is required")
         saved = self.get_state(f"persistent_user_profile:{user_id}", None)
         if not isinstance(saved, dict) or saved.get("user_id") != user_id or not isinstance(saved.get("text"), str):
